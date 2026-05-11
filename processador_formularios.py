@@ -8,7 +8,8 @@ import pytesseract
 from PIL import Image
 import pypdfium2 as pdfium
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox
+import customtkinter as ctk
 import threading
 
 # --- CONFIGURAÇÕES GLOBAIS ---
@@ -34,7 +35,8 @@ def converter_pdf_para_imagens(caminho_pdf: str, dpi: int) -> list:
     Returns:
         list: Uma lista de objetos de imagem PIL.
     """
-    print(f"Convertendo PDF '{caminho_pdf}' para imagens com {dpi} DPI usando pypdfium2...")
+    nome_arquivo = os.path.basename(caminho_pdf)
+    print(f"📂 ARQUIVO: {nome_arquivo}")
 
     try:
         pdf = pdfium.PdfDocument(caminho_pdf)
@@ -49,17 +51,44 @@ def converter_pdf_para_imagens(caminho_pdf: str, dpi: int) -> list:
             img = bitmap.to_pil()
             imagens.append(img)
             
-        print(f"Conversão concluída. {len(imagens)} páginas encontradas.")
+        print(f"📑 Total de páginas identificadas: {len(imagens)}\n")
         return imagens
     except Exception as e:
-        print(f"Erro ao converter PDF: {e}")
+        print(f"❌ Erro ao ler o arquivo: {e}")
         return []
+
+
+def corrigir_inclinacao(cinza: np.ndarray) -> np.ndarray:
+    """
+    Detecta a inclinação do texto e rotaciona a imagem para corrigi-la.
+    """
+    # Extrai coordenadas de pixels para calcular a inclinação
+    _, thresh = cv2.threshold(cinza, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    coords = np.column_stack(np.where(thresh > 0))
+    
+    if len(coords) == 0:
+        return cinza
+        
+    angle = cv2.minAreaRect(coords)[-1]
+
+    # Normalização estrita da rotação (evita giros de 90 graus imprevistos)
+    if angle > 45:
+        angle -= 90
+    elif angle < -45:
+        angle += 90
+
+    (h, w) = cinza.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(cinza, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    
+    return rotated
 
 
 def pre_processar_imagem_para_ocr(imagem_pil: Image) -> np.ndarray:
     """
     Aplica pré-processamento em uma imagem para melhorar a precisão do OCR.
-    Converte para escala de cinza e aplica um thresholding adaptativo.
+    Converte para escala de cinza, corrige a inclinação e aplica CLAHE com Otsu.
 
     Args:
         imagem_pil (Image): A imagem no formato PIL.
@@ -67,114 +96,110 @@ def pre_processar_imagem_para_ocr(imagem_pil: Image) -> np.ndarray:
     Returns:
         np.ndarray: A imagem processada no formato OpenCV (numpy array).
     """
-    # Converte de PIL Image para formato OpenCV (Numpy Array)
     imagem_cv = np.array(imagem_pil)
-    # Converte para escala de cinza
     cinza = cv2.cvtColor(imagem_cv, cv2.COLOR_BGR2GRAY)
     
-    # Suavização com GaussianBlur para remover ruídos comuns de digitalização (poeira, texturas)
-    desfoque = cv2.GaussianBlur(cinza, (5, 5), 0)
+    # Corrige inclinação
+    cinza_alinhada = corrigir_inclinacao(cinza)
     
-    # Aplica binarização adaptativa, excelente para lidar com sombras e iluminação irregular em scans
-    processada = cv2.adaptiveThreshold(
-        desfoque, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-    )
+    # Aplica CLAHE para aprimoramento de contraste
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cinza_clahe = clahe.apply(cinza_alinhada)
     
-    # Operação morfológica de abertura para eliminar pequenos pontos pretos (ruído).
-    # Invertemos a imagem pois o MORPH_OPEN atua reduzindo os pixels brancos (fundo).
-    kernel = np.ones((2, 2), np.uint8)
-    inv = cv2.bitwise_not(processada)
-    inv_aberta = cv2.morphologyEx(inv, cv2.MORPH_OPEN, kernel)
-    processada = cv2.bitwise_not(inv_aberta)
+    # Binarização rigorosa Otsu
+    _, processada = cv2.threshold(cinza_clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
     return processada
 
 
 def verificar_assinatura(imagem_processada: np.ndarray) -> bool:
     """
-    Localiza dinamicamente a área de assinatura via OCR e verifica se está preenchida.
-
-    Args:
-        imagem_processada (np.ndarray): A imagem binarizada.
-
-    Returns:
-        bool: True se a assinatura for detectada, False caso contrário.
+    Localiza a área de assinatura via OCR (múltiplas âncoras) ou usa Fallback Geométrico.
     """
-    # Define o limite para a metade inferior da página
-    altura_imagem, _ = imagem_processada.shape
+    altura_imagem, largura_imagem = imagem_processada.shape
     metade_y = int(altura_imagem * 0.5)
 
-    # Extrai dados do OCR (palavras e suas coordenadas)
     dados_ocr = pytesseract.image_to_data(imagem_processada, output_type=pytesseract.Output.DICT, lang='por')
-    
     n_boxes = len(dados_ocr['text'])
+    
+    # Múltiplas âncoras para não depender de ler apenas a palavra "assinatura"
+    ancoras = ['assinatura', 'assina', 'tutor', 'proprietário', 'proprietario', 'responsável', 'responsavel']
+    
     for i in range(n_boxes):
         y = dados_ocr['top'][i]
         
-        # Aprimoramento da Assinatura: ignora palavras que estão na metade superior
         if y < metade_y:
             continue
 
         texto_box = dados_ocr['text'][i].strip().lower()
         
-        # Tolerância para achar a palavra (pode ter ruído do OCR)
-        if 'assinatura' in texto_box or 'assina' in texto_box:
+        if any(ancora in texto_box for ancora in ancoras):
             x, y = dados_ocr['left'][i], dados_ocr['top'][i]
             w, h = dados_ocr['width'][i], dados_ocr['height'][i]
             
-            # Define ROI dinâmico: EXATAMENTE acima da linha de assinatura
-            roi_h = 150  # Altura projetada da área de assinatura
-            roi_y = max(0, y - roi_h - 20)  # Margem ampliada para ignorar a linha impressa
-            roi_w = max(w * 3, 200) # Garante largura mínima cobrindo a extensão da linha
-            roi_x = max(0, x - int((roi_w - w) / 2)) # Centraliza o ROI em relação à palavra
+            roi_h = 150 
+            roi_y = max(0, y - roi_h - 20) 
+            roi_w = max(w * 3, 200) 
+            roi_x = max(0, x - int((roi_w - w) / 2)) 
             
-            # Recorta a área da assinatura da imagem
             area_assinatura = imagem_processada[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
-
             total_pixels = area_assinatura.size
             if total_pixels == 0:
                 continue
 
-            # Calcula a densidade de pixels pretos (tinta) em imagens com limiarização adaptativa
             pixels_brancos = cv2.countNonZero(area_assinatura)
             pixels_pretos = total_pixels - pixels_brancos
-
             densidade_tinta = pixels_pretos / total_pixels
-            print(f"    [LOG] Região de Assinatura mapeada. Densidade de tinta: {densidade_tinta:.4f}")
-
-            # Consideramos assinado se tiver mais de 3% da área com tinta preta (evita sujeiras do scan)
-            if densidade_tinta > 0.03:
+            
+            if densidade_tinta > 0.015:
                 return True
+                
+    # --- FALLBACK GEOMÉTRICO ---
+    # Se o Tesseract não ler nenhuma âncora, recorta os 15% inferiores e 50% direitos da página
+    corte_y_fallback = int(altura_imagem * 0.85)
+    corte_x_fallback = int(largura_imagem * 0.50)
+    
+    area_fallback = imagem_processada[corte_y_fallback:altura_imagem, corte_x_fallback:largura_imagem]
+    total_pixels_fall = area_fallback.size
+    
+    if total_pixels_fall > 0:
+        pixels_brancos_fall = cv2.countNonZero(area_fallback)
+        pixels_pretos_fall = total_pixels_fall - pixels_brancos_fall
+        densidade_fall = pixels_pretos_fall / total_pixels_fall
+        
+        if densidade_fall > 0.015:
+            return True
             
     return False
 
 
 def limpar_valor(texto: str) -> str:
     """
-    Remove rótulos fantasmas capturados pelo OCR e limpa caracteres especiais, 
-    garantindo que fique apenas o valor limpo extraído.
+    Remove rótulos fantasmas capturados pelo OCR e limpa caracteres especiais.
     """
     if not texto:
         return "Não identificado"
     
+    # Lista atualizada com TODOS os fantasmas das 416 páginas do Castra-DF
     termos_remover = [
         r'nome completo', r'\(legível\)', r'assinatura', 
         r'responsável pelo animal', r'responsável', r'espécie', 
         r'especie', r'animal', r'cpf', r'paciente', r'data', r'rg',
         r'tutor', r'proprietário', r'nome do cliente', r'raça', r'idade',
         r'cor', r'sexo', r'peso', r'pelagem', r'tipo', r'nome', r'dono',
-        r'observações de interesse', r'relatado verbalmente', r'aproprietarioaresponsavel',
-        r'identificação do animal', r'\bpelo\b', r'impresso.*', r'p[áa]g\w*', r'crmv.*',
-        r'dados do animal', r'doc\.*', r'identifica[çc][ãa]o'
+        r'observações de interesse', r'relatado\s*verbalmente', r'redatado', r'verbanrta',
+        r'aproprietarioaresponsavel', r'identificação do animal', r'\bpelo\b', r'\bpe[lfj]o\b', 
+        r'impresso.*', r'p[áa]g\w*', r'crmv.*', r'dados do animal', r'doc\.*', 
+        r'identifica[çc][ãa]o', r'inscri[çc][ãa]o', r'm[eé]dic[oa].*veterin[aá]ri[oa]', 
+        r'animai', r'aniniai', r'peito', r'abaixo\s*identificado', r'abaixo\s*[wvw]entificado',
+        r'abaixo\s*aser', r'\bpala\b', r'\bpero\b'
     ]
     padrao = r'(?i)\b(?:' + '|'.join(termos_remover) + r')\b'
     texto_limpo = re.sub(padrao, '', str(texto))
     
-    # Remove pontuações ruidosas do OCR mantendo apenas letras, acentos e espaços
     texto_limpo = re.sub(r'[^A-Za-zÀ-ú ]', '', texto_limpo)
     texto_limpo = re.sub(r'\s+', ' ', texto_limpo).strip()
     
-    # Limpeza Inteligente: Remove letras soltas (ruído residual de OCR) no início, meio ou fim
     texto_limpo = re.sub(r'\b[A-Za-zÀ-ú]\b', '', texto_limpo)
     texto_limpo = re.sub(r'\s+', ' ', texto_limpo).strip()
     
@@ -259,7 +284,6 @@ def parsear_dados_do_texto(texto: str) -> dict:
                     dados["CPF"] = f"{num_cpf[:3]}.{num_cpf[3:6]}.{num_cpf[6:9]}-{num_cpf[9:]}"
                     encontrou_valido = True
                     cpf_linha_idx = i
-                    print(f"    [LOG] CPF matemático válido ancorado na linha {i}: {dados['CPF']}")
                     break
             
             if encontrou_valido:
@@ -267,7 +291,7 @@ def parsear_dados_do_texto(texto: str) -> dict:
             elif dados["CPF"] == "CPF não identificado" and len(num_limpo) == 11:
                 dados["CPF"] = "CPF Inválido"
                 cpf_linha_idx = i
-                print(f"    [ALERTA] CPF com 11 dígitos capturado, mas reprovado no Dígito Verificador: '{num_limpo[:11]}'")
+                print(f"  ⚠️ Alerta: Ignorando numeração semelhante a CPF (inválida): {num_limpo[:11]}")
 
     # 2. BUSCA DO NOME (Tutor)
     for i, linha in enumerate(linhas):
@@ -287,13 +311,11 @@ def parsear_dados_do_texto(texto: str) -> dict:
             
             if nome_limpo != "Não identificado":
                 dados["Nome Completo"] = nome_limpo
-                print(f"    [LOG] Tutor encontrado na linha do rótulo: '{nome_limpo}'")
                 break
             elif i + 1 < len(linhas):
                 nome_limpo_abaixo = limpar_valor(linhas[i+1])
                 if nome_limpo_abaixo != "Não identificado":
                     dados["Nome Completo"] = nome_limpo_abaixo
-                    print(f"    [LOG] Tutor encontrado na linha inferior ao rótulo: '{nome_limpo_abaixo}'")
                     break
 
     # Fallback Imbatível do Nome: Se o rótulo falhou, captura a linha diretamente acima do CPF.
@@ -304,7 +326,6 @@ def parsear_dados_do_texto(texto: str) -> dict:
             # Evita capturar RGs soltos
             if candidato != "Não identificado" and not re.search(r'(?i)(?:cpf|rg|doc)', linhas[j]):
                 dados["Nome Completo"] = candidato
-                print(f"    [LOG] Tutor recuperado via fallback (acima do CPF): '{candidato}'")
                 break
 
     # 3. BUSCA DO ANIMAL E ESPÉCIE 
@@ -323,15 +344,11 @@ def parsear_dados_do_texto(texto: str) -> dict:
             match_animal = re.search(r'(?i)\bnome\b(?!\s+completo)[\s:\-.]*([A-Za-zÀ-ú\s]+?)(?:[\n,]|esp[eéè]cie|ra[çc]a|sexo|idade|f[êe]mea|macho|nascid[oa]|pelagem)', busca_area)
             if match_animal:
                 dados["Nome do Animal"] = limpar_valor(match_animal.group(1))
-                if dados["Nome do Animal"] != "Não identificado":
-                    print(f"    [LOG] Nome do Animal extraído: '{dados['Nome do Animal']}'")
                 
             # Extrai Espécie com os mesmos bloqueios
             match_especie = re.search(r'(?i)esp[eéè]cie[\s:\-.]*([A-Za-zÀ-ú\s]+?)(?:[\n,]|$|ra[çc]a|sexo|idade|f[êe]mea|macho|nascid[oa]|pelagem)', busca_area)
             if match_especie:
                 dados["Espécie"] = limpar_valor(match_especie.group(1))
-                if dados["Espécie"] != "Não identificado":
-                    print(f"    [LOG] Espécie extraída: '{dados['Espécie']}'")
             
             if dados["Nome do Animal"] != "Não identificado" or dados["Espécie"] != "Não identificado":
                 break
@@ -345,13 +362,12 @@ def parsear_dados_do_texto(texto: str) -> dict:
                 especie_limpa = limpar_valor(match_especie_fallback.group(1))
                 if especie_limpa != "Não identificado":
                     dados["Espécie"] = especie_limpa
-                    print(f"    [LOG] Espécie recuperada via fallback de varredura: '{especie_limpa}'")
                     break
                     
     # --- VALIDAÇÃO FINAL ANTI-CROSS-CAPTURE ---
     # Se o nome do animal for idêntico ao do tutor (ou englobá-lo), descarta o animal para evitar duplicação irreal
     if dados["Nome Completo"] != "Não identificado" and dados["Nome do Animal"] == dados["Nome Completo"]:
-        print(f"    [ALERTA] Falso Positivo interceptado: Nome do Animal ('{dados['Nome do Animal']}') foi anulado por ser espelho do Tutor.")
+        print(f"  ⚠️ Alerta: Pet e Tutor com mesmo nome. Omitindo pet (possível falso positivo).")
         dados["Nome do Animal"] = "Não identificado"
 
     # --- PADRONIZAÇÃO DE TEXTO (TITLE CASE) ---
@@ -379,180 +395,391 @@ class RedirecionadorTerminal:
         self.widget_texto.after(0, self._inserir, string)
 
     def _inserir(self, string):
-        self.widget_texto.insert(tk.END, string)
-        self.widget_texto.see(tk.END) # Faz o scroll automático ir para baixo
+        self.widget_texto.insert("end", string)
+        self.widget_texto.see("end") # Faz o scroll automático ir para baixo
 
     def flush(self):
         pass
 
 
-def processar_pdf_formularios(caminho_pdf: str, arquivo_saida: str = "resultado_formularios.xlsx"):
+def processar_pdf_formularios(caminho_pdf: str, progresso_callback=None, itens_revisao_callback=None):
     """
-    Função principal que orquestra todo o processo de extração de dados do PDF.
+    Processa o PDF, extrai os dados, aplica OCR de 2ª chance e alimenta os Bancos de Dados.
     """
     imagens_pil = converter_pdf_para_imagens(caminho_pdf, DPI_CONVERSAO)
     if not imagens_pil:
         return
 
     dados_coletados = []
+    total_paginas = len(imagens_pil)
+    
     for i, imagem_pil in enumerate(imagens_pil):
-        print(f"\nProcessando página {i+1}/{len(imagens_pil)}...")
+        print(f"📄 PÁGINA {i+1} / {total_paginas}")
+        print("━" * 45)
+        if progresso_callback:
+            progresso_callback(i, total_paginas)
 
-        # 1. Pré-processamento da imagem
+        # 1. Pré-processamento e corte
         imagem_processada = pre_processar_imagem_para_ocr(imagem_pil)
-
-        # Filtro de Área: Ignora os primeiros 5% da página (cabeçalhos médicos)
         h_img, w_img = imagem_processada.shape
         corte_y = int(h_img * 0.05)
         imagem_dados = imagem_processada[corte_y:h_img, 0:w_img]
 
-        # 2. Extração de texto com OCR (apenas na área recortada de dados)
-        print("  - Executando OCR na área de dados (inferior 95%)...")
-        # lang='por' para usar o modelo de linguagem em português
-        texto_extraido = pytesseract.image_to_string(
-            imagem_dados, lang='por')
+        # 2. OCR (Primeira Passagem)
+        texto_extraido = pytesseract.image_to_string(imagem_dados, lang='por')
 
-        # 3. Parseamento dos dados do texto
-        print("  - Extraindo campos específicos...")
+        # 3. Parseamento
         dados_pagina = parsear_dados_do_texto(texto_extraido)
+        
+        # 4. INTELIGÊNCIA OCR: Segunda Chance (Inversão de Cores)
+        if dados_pagina["Nome Completo"] == "Não identificado":
+            print("  🔄 Tratando imagem para melhorar legibilidade...")
+            imagem_invertida = cv2.bitwise_not(imagem_dados)
+            texto_inv = pytesseract.image_to_string(imagem_invertida, lang='por')
+            dados_inv = parsear_dados_do_texto(texto_inv)
+            
+            if dados_inv["Nome Completo"] != "Não identificado":
+                dados_pagina["Nome Completo"] = dados_inv["Nome Completo"]
+
         dados_pagina["Página"] = i + 1
 
-        # 4. Verificação da assinatura
-        print("  - Verificando assinatura dinamicamente...")
+        # 5. Assinatura
         assinatura_presente = verificar_assinatura(imagem_processada)
-        dados_pagina["Assinatura Presente"] = assinatura_presente
+        dados_pagina["Assinatura Presente"] = "Sim" if assinatura_presente else "Não"
 
-        print(f"  - Dados extraídos: {dados_pagina}")
+        status_ass = "✅ Identificada" if assinatura_presente else "❌ Não identificada"
+        print(f"  👤 Tutor:      {dados_pagina.get('Nome Completo', '')}")
+        print(f"  🪪 CPF:        {dados_pagina.get('CPF', '')}")
+        print(f"  🐾 Pet:        {dados_pagina.get('Nome do Animal', '')} ({dados_pagina.get('Espécie', '')})")
+        print(f"  ✍️ Assinatura: {status_ass}")
+        print("━" * 45 + "\n")
         dados_coletados.append(dados_pagina)
 
-    # 5. Criação do DataFrame e análise de duplicidade
-    print("\nCriando DataFrame e analisando duplicidades...")
-    df = pd.DataFrame(dados_coletados)
+    if progresso_callback:
+        progresso_callback(total_paginas, total_paginas)
 
-    # 6. Inteligência de Dados: Validação e Duplicidade
-    if not df.empty:
-        # Cruza [CPF + Animal] para identificar repetidos
-        duplicados = df.duplicated(subset=['CPF', 'Nome do Animal'], keep=False)
-        
-        status_registros = []
-        for idx, row in df.iterrows():
-            status = []
-            # Evita marcar 'CPF não identificado' como duplicado genérico com outros não identificados
-            if duplicados[idx] and row['CPF'] not in ['CPF não identificado', 'Não identificado']:
-                status.append('DUPLICADO')
-            
-            if row.get('CPF') == 'CPF Inválido':
-                status.append('CPF MATEMATICAMENTE INVÁLIDO')
+    if not dados_coletados:
+        return
 
-            if not row.get('Assinatura Presente', True):
-                status.append('PENDENTE ASSINATURA')
-            
-            if not status:
-                status.append('OK')
-                
-            status_registros.append(' / '.join(status))
-            
-        df['Status_Registro'] = status_registros
-        df.drop(columns=['Status_CPF'], inplace=True, errors='ignore')
+    # --- INTELIGÊNCIA DE BANCO DE DADOS LOCAL ---
+    print("💾 Sincronizando dados com as planilhas do sistema...")
+    df_novo = pd.DataFrame(dados_coletados)
+    
+    diretorio_base = os.path.dirname(caminho_pdf)
+    nome_arquivo = os.path.basename(caminho_pdf)
+    banco_mestre_path = os.path.join(diretorio_base, 'BANCO_MESTRE_CASTRA.xlsx')
+    revisao_manual_path = os.path.join(diretorio_base, 'REVISAO_MANUAL_CASTRA.xlsx')
 
-        # Reordena as colunas conforme a especificação solicitada
-        colunas_finais = ['Página', 'Nome Completo', 'CPF', 'Nome do Animal', 'Espécie', 'Assinatura Presente', 'Status_Registro']
-        df = df[[col for col in colunas_finais if col in df.columns]]
+    # 1. Atualizar Banco Mestre (Acumulado)
+    if os.path.exists(banco_mestre_path):
+        try:
+            df_mestre = pd.read_excel(banco_mestre_path)
+            df_final = pd.concat([df_mestre, df_novo], ignore_index=True)
+        except Exception:
+            df_final = df_novo.copy()
+    else:
+        df_final = df_novo.copy()
 
-    # 7. Exportação para Excel
+    # Remove Duplicados (CPF e Nome do Animal), protegendo os não identificados contra deleção em massa
+    mascara_validos = (df_final['CPF'] != 'CPF não identificado') & (df_final['CPF'] != 'Não identificado') & (df_final['CPF'] != 'CPF Inválido')
+    duplicados = df_final[mascara_validos].duplicated(subset=['CPF', 'Nome do Animal'], keep='last')
+    df_final = df_final.drop(duplicados[duplicados].index)
+    
+    colunas_ordem = ['Página', 'Nome Completo', 'CPF', 'Nome do Animal', 'Espécie', 'Assinatura Presente']
+    df_final = df_final[[col for col in colunas_ordem if col in df_final.columns]]
+    
     try:
-        df.to_excel(arquivo_saida, index=False, engine='openpyxl')
-        print(
-            f"\nProcesso concluído com sucesso! Resultados salvos em '{arquivo_saida}'.")
+        df_final.to_excel(banco_mestre_path, index=False, engine='openpyxl')
+        print(f"✅ Base acumulada atualizada: {banco_mestre_path}")
     except Exception as e:
-        print(f"\nErro ao salvar o arquivo Excel: {e}")
-        print("Tentando salvar como CSV...")
-        df.to_csv(arquivo_saida.replace('.xlsx', '.csv'), index=False)
-        print(
-            f"Resultados salvos em '{arquivo_saida.replace('.xlsx', '.csv')}'.")
+        print(f"❌ Erro ao salvar base acumulada: {e}")
+
+    # 2. Relatório de Inconsistências (Revisão Humana)
+    erros_list = []
+    for _, row in df_novo.iterrows():
+        motivos = []
+        if row.get('Nome Completo') == "Não identificado":
+            motivos.append("Nome Ausente/Ilegível")
+        if row.get('CPF') in ["CPF não identificado", "CPF Inválido", "Não identificado"]:
+            motivos.append("CPF Ausente/Inválido")
+        if row.get('Assinatura Presente') == "Não":
+            motivos.append("Assinatura Pendente")
+        
+        if motivos:
+            dict_erro = row.to_dict()
+            dict_erro['Motivo da Falha'] = " | ".join(motivos)
+            dict_erro['Arquivo Origem'] = nome_arquivo
+            erros_list.append(dict_erro)
+
+    if itens_revisao_callback:
+        itens_revisao_callback(len(erros_list))
+
+    if erros_list:
+        df_erros = pd.DataFrame(erros_list)
+        if os.path.exists(revisao_manual_path):
+            try:
+                df_revisao_antigo = pd.read_excel(revisao_manual_path)
+                df_revisao_final = pd.concat([df_revisao_antigo, df_erros], ignore_index=True)
+            except Exception:
+                df_revisao_final = df_erros
+        else:
+            df_revisao_final = df_erros
+        
+        # Deduplicação do relatório de erros
+        try:
+            df_revisao_final = df_revisao_final.drop_duplicates(subset=['CPF', 'Nome do Animal', 'Motivo da Falha', 'Arquivo Origem'], keep='last')
+        except Exception:
+            pass
+        
+        try:
+            df_revisao_final.to_excel(revisao_manual_path, index=False, engine='openpyxl')
+            print(f"⚠️ Relatório de revisão gerado: {revisao_manual_path}")
+        except Exception as e:
+            print(f"❌ Erro ao salvar relatório de revisão: {e}")
 
 
 def iniciar_gui():
+    ctk.set_appearance_mode("System")
+    ctk.set_default_color_theme("blue")
+    
+    root = ctk.CTk()
+    root.title("Castra-DF - Processador de Formulários Mestre")
+    root.geometry("1100x750")
+    
+    style = ttk.Style(root)
+    style.theme_use('clam')
+    
+    frame_top = ctk.CTkFrame(root, fg_color="transparent")
+    frame_top.pack(fill=tk.X, padx=15, pady=(15, 0))
+    
+    def change_appearance_mode_event(new_appearance_mode: str):
+        ctk.set_appearance_mode(new_appearance_mode)
+        bg_color = "#2b2b2b" if new_appearance_mode == "Dark" else "#ebebeb"
+        text_color = "white" if new_appearance_mode == "Dark" else "black"
+        head_bg = "#1f538d"
+        
+        style.configure("Treeview", background=bg_color, foreground=text_color, fieldbackground=bg_color, borderwidth=0, rowheight=25)
+        style.map('Treeview', background=[('selected', '#1f538d')], foreground=[('selected', 'white')])
+        style.configure("Treeview.Heading", background=head_bg, foreground="white", font=("Segoe UI", 10, "bold"))
+
+    modo_label = ctk.CTkLabel(frame_top, text="Tema:", font=("Segoe UI", 12))
+    modo_label.pack(side=tk.RIGHT, padx=(10, 5))
+    
+    modo_menu = ctk.CTkOptionMenu(frame_top, values=["Dark", "Light", "System"], command=change_appearance_mode_event)
+    modo_menu.pack(side=tk.RIGHT)
+    modo_menu.set("Dark")
+    change_appearance_mode_event("Dark")
+    
+    notebook = ctk.CTkTabview(root)
+    notebook.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+    
+    tab_processar = notebook.add('⚙️ Processar PDFs')
+    tab_banco = notebook.add('🗄️ Base de Dados Acumulada')
+    tab_erros = notebook.add('⚠️ Relatório de Erros')
+    
+    # --- ABA 1: PROCESSAMENTO ---
+    ctk.CTkLabel(tab_processar, text="Selecione o arquivo PDF ou Pasta para processamento em lote:", font=("Segoe UI", 14, "bold")).pack(anchor=tk.W, padx=20, pady=(10, 10))
+    
+    frame_arquivo = ctk.CTkFrame(tab_processar)
+    frame_arquivo.pack(fill=tk.X, padx=20, pady=5)
+    
+    entrada_pdf = ctk.CTkEntry(frame_arquivo, font=("Segoe UI", 12))
+    entrada_pdf.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 10), pady=10)
+    
     def selecionar_pdf():
-        caminho = filedialog.askopenfilename(
-            title="Selecione o arquivo PDF",
-            filetypes=[("Arquivos PDF", "*.pdf")]
-        )
+        caminho = filedialog.askopenfilename(title="Selecione o PDF", filetypes=[("Arquivos PDF", "*.pdf")])
         if caminho:
-            entrada_pdf.delete(0, tk.END)
+            entrada_pdf.delete(0, "end")
             entrada_pdf.insert(0, caminho)
-
-    def executar_processamento():
-        caminho_pdf = entrada_pdf.get()
-        if not caminho_pdf or not os.path.exists(caminho_pdf):
-            messagebox.showerror("Erro", "Por favor, selecione um arquivo PDF válido.")
-            return
-
-        botao_processar.config(state=tk.DISABLED)
-        label_status.config(text="Status: Processando... Isso pode demorar alguns minutos.", fg="blue")
-
-        # Rodar o processamento em uma thread separada evita que a interface congele
-        def thread_processamento():
-            try:
-                # Salva o arquivo de resultado na mesma pasta onde está o PDF selecionado
-                pasta_origem = os.path.dirname(caminho_pdf)
-                arquivo_saida = os.path.join(pasta_origem, "resultado_formularios.xlsx")
-                
-                processar_pdf_formularios(caminho_pdf, arquivo_saida)
-                
-                root.after(0, lambda: label_status.config(text="Status: Concluído!", fg="green"))
-                root.after(0, lambda: messagebox.showinfo("Sucesso", f"Processamento concluído!\nArquivo salvo em:\n{arquivo_saida}"))
-            except Exception as e:
-                root.after(0, lambda: label_status.config(text="Status: Erro durante o processamento!", fg="red"))
-                root.after(0, lambda: messagebox.showerror("Erro", f"Ocorreu um erro:\n{e}"))
-            finally:
-                root.after(0, lambda: botao_processar.config(state=tk.NORMAL))
-
-        threading.Thread(target=thread_processamento, daemon=True).start()
-
-    root = tk.Tk()
-    root.title("Processador de Formulários - Animais")
-    root.geometry("800x600")
-    root.resizable(True, True)
+            atualizar_tabelas() # Tenta carregar os bancos do diretório do PDF selecionado
+            
+    def selecionar_pasta():
+        caminho = filedialog.askdirectory(title="Selecione a Pasta com PDFs")
+        if caminho:
+            entrada_pdf.delete(0, "end")
+            entrada_pdf.insert(0, caminho)
+            atualizar_tabelas()
+            
+    ctk.CTkButton(frame_arquivo, text="Procurar Pasta", command=selecionar_pasta).pack(side=tk.RIGHT, padx=(5, 10), pady=10)
+    ctk.CTkButton(frame_arquivo, text="Procurar Arquivo", command=selecionar_pdf).pack(side=tk.RIGHT, pady=10)
     
-    frame = tk.Frame(root, padx=20, pady=20)
-    frame.pack(fill=tk.BOTH, expand=True)
-
-    tk.Label(frame, text="Arquivo PDF para Processar:").pack(anchor=tk.W)
+    # Dashboard
+    frame_dash = ctk.CTkFrame(tab_processar)
+    frame_dash.pack(fill=tk.X, padx=20, pady=15)
     
-    frame_arquivo = tk.Frame(frame)
-    frame_arquivo.pack(fill=tk.X, pady=(5, 15))
+    barra_progresso = ctk.CTkProgressBar(frame_dash)
+    barra_progresso.pack(fill=tk.X, padx=15, pady=(15, 10))
+    barra_progresso.set(0)
     
-    entrada_pdf = tk.Entry(frame_arquivo)
-    entrada_pdf.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+    lbl_progresso = ctk.CTkLabel(frame_dash, text="Pronto para iniciar.", font=("Segoe UI", 12, "italic"), text_color="gray")
+    lbl_progresso.pack(anchor=tk.W, padx=15, pady=(0, 10))
     
-    botao_procurar = tk.Button(frame_arquivo, text="Procurar...", command=selecionar_pdf)
-    botao_procurar.pack(side=tk.RIGHT)
-
-    botao_processar = tk.Button(frame, text="Iniciar Processamento", command=executar_processamento, bg="#4CAF50", fg="white", font=("Arial", 10, "bold"))
-    botao_processar.pack(fill=tk.X, pady=(10, 10))
-
-    label_status = tk.Label(frame, text="Status: Aguardando seleção.", fg="gray")
-    label_status.pack(anchor=tk.W)
+    lbl_revisao = ctk.CTkLabel(frame_dash, text="Itens que precisam de revisão humana: 0", font=("Segoe UI", 14, "bold"), text_color="#f38ba8")
+    lbl_revisao.pack(anchor=tk.E, side=tk.BOTTOM, padx=15, pady=(0, 15))
     
-    # --- CONSOLE DE LOGS INTERNO ---
-    tk.Label(frame, text="Console de Execução e Auditoria:").pack(anchor=tk.W, pady=(15, 5))
+    btn_processar = ctk.CTkButton(tab_processar, text="▶ INICIAR", font=("Segoe UI", 14, "bold"), height=40, command=lambda: iniciar_thread())
+    btn_processar.pack(fill=tk.X, padx=20, pady=10)
     
-    frame_console = tk.Frame(frame)
-    frame_console.pack(fill=tk.BOTH, expand=True)
+    # Console
+    ctk.CTkLabel(tab_processar, text="Console de Execução:", font=("Segoe UI", 12, "bold")).pack(anchor=tk.W, padx=20, pady=(10, 5))
+    texto_console = ctk.CTkTextbox(tab_processar, font=("Consolas", 12), wrap="word")
+    texto_console.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
     
-    scrollbar_console = tk.Scrollbar(frame_console)
-    scrollbar_console.pack(side=tk.RIGHT, fill=tk.Y)
-    
-    texto_console = tk.Text(frame_console, wrap=tk.WORD, yscrollcommand=scrollbar_console.set, bg="#1e1e1e", fg="#00ff00", font=("Consolas", 10))
-    texto_console.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    scrollbar_console.config(command=texto_console.yview)
-
-    # Ativa o redirecionamento global do Terminal para a Tela
     sys.stdout = RedirecionadorTerminal(texto_console)
+    
+    total_revisao = [0]
 
+    def cb_revisao(qnt):
+        total_revisao[0] += qnt
+        lbl_revisao.configure(text=f"Itens que precisam de revisão humana (Total Acumulado): {total_revisao[0]}")
+        root.update_idletasks()
+        
+    def iniciar_thread():
+        caminho_input = entrada_pdf.get()
+        if not caminho_input or not os.path.exists(caminho_input):
+            messagebox.showerror("Erro", "Por favor, selecione um arquivo ou pasta válida.")
+            return
+            
+        btn_processar.configure(state="disabled")
+        barra_progresso.set(0)
+        total_revisao[0] = 0
+        lbl_revisao.configure(text="Itens que precisam de revisão humana: 0")
+        
+        def run():
+            try:
+                if os.path.isdir(caminho_input):
+                    arquivos_pdf = [os.path.join(caminho_input, f) for f in os.listdir(caminho_input) if f.lower().endswith('.pdf')]
+                    if not arquivos_pdf:
+                        root.after(0, lambda: messagebox.showwarning("Aviso", "Nenhum PDF encontrado na pasta selecionada."))
+                        return
+                else:
+                    arquivos_pdf = [caminho_input]
+
+                total_pdfs = len(arquivos_pdf)
+                for idx, pdf in enumerate(arquivos_pdf):
+                    
+                    def cb_progresso(atual, total, idx=idx, total_pdfs=total_pdfs):
+                        pct = atual / total if total > 0 else 0
+                        barra_progresso.set(pct)
+                        lbl_progresso.configure(text=f"[Arquivo {idx+1}/{total_pdfs}] Processando página {atual} de {total} ({pct*100:.1f}%)")
+                        root.update_idletasks()
+                        
+                    processar_pdf_formularios(pdf, progresso_callback=cb_progresso, itens_revisao_callback=cb_revisao)
+                    
+                root.after(0, lambda: messagebox.showinfo("Concluído", "Processamento finalizado!\nVerifique as abas de Banco e Erros."))
+                root.after(0, atualizar_tabelas)
+            except Exception as e:
+                root.after(0, lambda: messagebox.showerror("Erro de Execução", f"Ocorreu um erro inesperado:\n{e}"))
+            finally:
+                root.after(0, lambda: btn_processar.configure(state="normal"))
+                
+        threading.Thread(target=run, daemon=True).start()
+        
+    # --- ABAS DE TABELAS (Bancos e Erros) ---
+    def configurar_treeview(parent):
+        frame_tv = ctk.CTkFrame(parent)
+        frame_tv.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        scroll_y = ttk.Scrollbar(frame_tv)
+        scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        scroll_x = ttk.Scrollbar(frame_tv, orient=tk.HORIZONTAL)
+        scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        tv = ttk.Treeview(frame_tv, yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+        tv.pack(fill=tk.BOTH, expand=True)
+        
+        scroll_y.config(command=tv.yview)
+        scroll_x.config(command=tv.xview)
+        
+        return tv
+
+    # --- BARRA DE PESQUISA (Aba Banco de Dados) ---
+    frame_pesquisa = ctk.CTkFrame(tab_banco)
+    frame_pesquisa.pack(fill=tk.X, padx=10, pady=(10, 0))
+    
+    ctk.CTkLabel(frame_pesquisa, text="Pesquisar por Nome/CPF:", font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT, padx=(10, 5), pady=10)
+    entrada_pesquisa = ctk.CTkEntry(frame_pesquisa, font=("Segoe UI", 12), width=250)
+    entrada_pesquisa.pack(side=tk.LEFT, padx=5, pady=10)
+    
+    def pesquisar_banco():
+        termo = entrada_pesquisa.get().strip().lower()
+        if not termo:
+            return
+            
+        caminho_input = entrada_pdf.get()
+        if caminho_input and os.path.exists(caminho_input):
+            if os.path.isdir(caminho_input):
+                diretorio_base = caminho_input
+            else:
+                diretorio_base = os.path.dirname(caminho_input)
+        else:
+            diretorio_base = os.getcwd()
+            
+        banco_mestre_path = os.path.join(diretorio_base, 'BANCO_MESTRE_CASTRA.xlsx')
+        if not os.path.exists(banco_mestre_path):
+            return
+            
+        try:
+            df = pd.read_excel(banco_mestre_path).fillna("---")
+            mask = df['Nome Completo'].astype(str).str.lower().str.contains(termo) | \
+                   df['CPF'].astype(str).str.lower().str.contains(termo)
+            df_filtrado = df[mask]
+            
+            for row in tv_banco.get_children(): tv_banco.delete(row)
+            tv_banco["columns"] = list(df_filtrado.columns)
+            tv_banco["show"] = "headings"
+            for col in tv_banco["columns"]:
+                tv_banco.heading(col, text=col)
+                tv_banco.column(col, width=150, anchor=tk.CENTER)
+            for _, row in df_filtrado.iterrows():
+                tv_banco.insert("", "end", values=list(row))
+        except Exception as e:
+            print(f"Erro ao pesquisar: {e}")
+
+    def limpar_filtro():
+        entrada_pesquisa.delete(0, "end")
+        atualizar_tabelas()
+
+    ctk.CTkButton(frame_pesquisa, text="Pesquisar", command=pesquisar_banco, width=100).pack(side=tk.LEFT, padx=5, pady=10)
+    ctk.CTkButton(frame_pesquisa, text="Limpar Filtro", command=limpar_filtro, width=100).pack(side=tk.LEFT, padx=5, pady=10)
+
+    tv_banco = configurar_treeview(tab_banco)
+    tv_erros = configurar_treeview(tab_erros)
+    
+    def carregar_dados_tv(tv, caminho_excel):
+        for row in tv.get_children(): tv.delete(row)
+        if os.path.exists(caminho_excel):
+            try:
+                df = pd.read_excel(caminho_excel).fillna("---")
+                tv["columns"] = list(df.columns)
+                tv["show"] = "headings"
+                for col in tv["columns"]:
+                    tv.heading(col, text=col)
+                    tv.column(col, width=150, anchor=tk.CENTER)
+                for _, row in df.iterrows():
+                    tv.insert("", "end", values=list(row))
+            except Exception as e:
+                print(f"Erro ao carregar visualização de {caminho_excel}: {e}")
+
+    def atualizar_tabelas():
+        caminho_input = entrada_pdf.get()
+        if caminho_input and os.path.exists(caminho_input):
+            if os.path.isdir(caminho_input):
+                diretorio_base = caminho_input
+            else:
+                diretorio_base = os.path.dirname(caminho_input)
+        else:
+            diretorio_base = os.getcwd()
+            
+        banco_mestre_path = os.path.join(diretorio_base, 'BANCO_MESTRE_CASTRA.xlsx')
+        revisao_manual_path = os.path.join(diretorio_base, 'REVISAO_MANUAL_CASTRA.xlsx')
+        
+        carregar_dados_tv(tv_banco, banco_mestre_path)
+        carregar_dados_tv(tv_erros, revisao_manual_path)
+
+    # Tenta carregar tabelas do diretório atual se existirem
+    atualizar_tabelas()
     root.mainloop()
 
-# --- EXECUÇÃO DO SCRIPT ---
 if __name__ == "__main__":
     iniciar_gui()
