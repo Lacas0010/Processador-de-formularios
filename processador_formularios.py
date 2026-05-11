@@ -14,9 +14,23 @@ import threading
 
 # --- CONFIGURAÇÕES GLOBAIS ---
 
-# Para usuários de Windows, especifique o caminho para o executável do Tesseract.
-# Se o Tesseract não estiver no PATH do sistema, descomente e ajuste a linha abaixo.
-pytesseract.pytesseract.tesseract_cmd = r'C:\Users\07049770108\AppData\Local\Programs\Tesseract-OCR\tesseract.exe'
+# --- CONFIGURAÇÃO INTELIGENTE DO TESSERACT PARA O .EXE ---
+def obter_caminho_tesseract():
+    """
+    Descobre se o programa está rodando como script Python normal ou como um .exe compilado,
+    e aponta para a pasta correta do Tesseract embutido.
+    """
+    if getattr(sys, 'frozen', False):
+        # Se estiver rodando como .exe (o PyInstaller extrai os arquivos para a pasta temporária sys._MEIPASS)
+        base_path = sys._MEIPASS
+    else:
+        # Se estiver rodando no VS Code como script normal
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        
+    return os.path.join(base_path, 'Tesseract-OCR', 'tesseract.exe')
+
+# Aplica o caminho dinâmico
+pytesseract.pytesseract.tesseract_cmd = obter_caminho_tesseract()
 
 # Qualidade da imagem em DPI (Dots Per Inch). 300 é um bom valor para OCR.
 DPI_CONVERSAO = 300
@@ -471,9 +485,11 @@ def processar_pdf_formularios(caminho_pdf: str, progresso_callback=None, itens_r
     revisao_manual_path = os.path.join(diretorio_base, 'REVISAO_MANUAL_CASTRA.xlsx')
 
     # 1. Atualizar Banco Mestre (Acumulado)
+    df_mestre_check = pd.DataFrame()
     if os.path.exists(banco_mestre_path):
         try:
             df_mestre = pd.read_excel(banco_mestre_path)
+            df_mestre_check = df_mestre.copy()
             df_final = pd.concat([df_mestre, df_novo], ignore_index=True)
         except Exception:
             df_final = df_novo.copy()
@@ -496,15 +512,39 @@ def processar_pdf_formularios(caminho_pdf: str, progresso_callback=None, itens_r
 
     # 2. Relatório de Inconsistências (Revisão Humana)
     erros_list = []
+    vistos_lote = set()
     for _, row in df_novo.iterrows():
         motivos = []
         if row.get('Nome Completo') == "Não identificado":
             motivos.append("Nome Ausente/Ilegível")
         if row.get('CPF') in ["CPF não identificado", "CPF Inválido", "Não identificado"]:
             motivos.append("CPF Ausente/Inválido")
+        if row.get('Nome do Animal') == "Não identificado":
+            motivos.append("Animal Ausente/Ilegível")
+        if row.get('Espécie') == "Não identificado":
+            motivos.append("Espécie Ausente/Ilegível")
         if row.get('Assinatura Presente') == "Não":
             motivos.append("Assinatura Pendente")
         
+        # Verifica duplicidade (cruzando com banco mestre existente e com o lote atual)
+        is_dup = False
+        cpf_valido = row.get('CPF') not in ["CPF não identificado", "CPF Inválido", "Não identificado"]
+        if cpf_valido:
+            cpf = row.get('CPF')
+            animal = row.get('Nome do Animal')
+            if not df_mestre_check.empty and 'CPF' in df_mestre_check.columns and 'Nome do Animal' in df_mestre_check.columns:
+                match = (df_mestre_check['CPF'] == cpf) & (df_mestre_check['Nome do Animal'] == animal)
+                if match.any():
+                    is_dup = True
+            
+            if (cpf, animal) in vistos_lote:
+                is_dup = True
+            else:
+                vistos_lote.add((cpf, animal))
+
+        if is_dup:
+            motivos.append("Registro Duplicado")
+
         if motivos:
             dict_erro = row.to_dict()
             dict_erro['Motivo da Falha'] = " | ".join(motivos)
@@ -744,6 +784,30 @@ def iniciar_gui():
     ctk.CTkButton(frame_pesquisa, text="Limpar Filtro", command=limpar_filtro, width=100).pack(side=tk.LEFT, padx=5, pady=10)
 
     tv_banco = configurar_treeview(tab_banco)
+    
+    # --- CARDS DO RELATÓRIO DE ERROS ---
+    frame_cards_erros = ctk.CTkFrame(tab_erros, fg_color="transparent")
+    frame_cards_erros.pack(fill=tk.X, padx=10, pady=(10, 0))
+
+    var_faltantes_tutor = tk.StringVar(value="Tutor não ident.: 0")
+    var_faltantes_cpf = tk.StringVar(value="CPF inválido: 0")
+    var_faltantes_animal = tk.StringVar(value="Animal não ident.: 0")
+    var_faltantes_especie = tk.StringVar(value="Espécie não ident.: 0")
+    var_repetidos = tk.StringVar(value="Repetidos: 0")
+
+    def criar_card_erro(parent, text_var, color):
+        card = ctk.CTkFrame(parent, fg_color=color, corner_radius=8)
+        card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+        lbl = ctk.CTkLabel(card, textvariable=text_var, font=("Segoe UI", 12, "bold"), text_color="white")
+        lbl.pack(padx=5, pady=15)
+        return card
+
+    criar_card_erro(frame_cards_erros, var_faltantes_tutor, "#d9534f")   # Vermelho
+    criar_card_erro(frame_cards_erros, var_faltantes_cpf, "#f0ad4e")     # Laranja
+    criar_card_erro(frame_cards_erros, var_faltantes_animal, "#5bc0de")  # Azul Claro
+    criar_card_erro(frame_cards_erros, var_faltantes_especie, "#5cb85c") # Verde
+    criar_card_erro(frame_cards_erros, var_repetidos, "#6c757d")         # Cinza
+
     tv_erros = configurar_treeview(tab_erros)
     
     def carregar_dados_tv(tv, caminho_excel):
@@ -776,6 +840,31 @@ def iniciar_gui():
         
         carregar_dados_tv(tv_banco, banco_mestre_path)
         carregar_dados_tv(tv_erros, revisao_manual_path)
+        
+        # --- Atualizar Cards ---
+        if os.path.exists(revisao_manual_path):
+            try:
+                df_erros = pd.read_excel(revisao_manual_path)
+                
+                tutor_ausente = len(df_erros[df_erros['Nome Completo'] == 'Não identificado'])
+                cpf_ausente = len(df_erros[df_erros['CPF'].isin(['Não identificado', 'CPF não identificado', 'CPF Inválido'])])
+                animal_ausente = len(df_erros[df_erros['Nome do Animal'] == 'Não identificado'])
+                especie_ausente = len(df_erros[df_erros['Espécie'] == 'Não identificado'])
+                repetidos = len(df_erros[df_erros['Motivo da Falha'].astype(str).str.contains('Registro Duplicado')])
+                
+                var_faltantes_tutor.set(f"Tutor não ident.: {tutor_ausente}")
+                var_faltantes_cpf.set(f"CPF inválido: {cpf_ausente}")
+                var_faltantes_animal.set(f"Animal não ident.: {animal_ausente}")
+                var_faltantes_especie.set(f"Espécie não ident.: {especie_ausente}")
+                var_repetidos.set(f"Repetidos: {repetidos}")
+            except Exception as e:
+                print(f"Erro ao atualizar cards: {e}")
+        else:
+            var_faltantes_tutor.set("Tutor não ident.: 0")
+            var_faltantes_cpf.set("CPF inválido: 0")
+            var_faltantes_animal.set("Animal não ident.: 0")
+            var_faltantes_especie.set("Espécie não ident.: 0")
+            var_repetidos.set("Repetidos: 0")
 
     # Tenta carregar tabelas do diretório atual se existirem
     atualizar_tabelas()
