@@ -38,40 +38,6 @@ DPI_CONVERSAO = 300
 # --- FUNÇÕES MODULARES ---
 
 
-def converter_pdf_para_imagens(caminho_pdf: str, dpi: int) -> list:
-    """
-    Converte todas as páginas de um arquivo PDF em uma lista de imagens PIL.
-
-    Args:
-        caminho_pdf (str): O caminho para o arquivo PDF.
-        dpi (int): A resolução das imagens a serem geradas.
-
-    Returns:
-        list: Uma lista de objetos de imagem PIL.
-    """
-    nome_arquivo = os.path.basename(caminho_pdf)
-    print(f"📂 ARQUIVO: {nome_arquivo}")
-
-    try:
-        pdf = pdfium.PdfDocument(caminho_pdf)
-        imagens = []
-        
-        # O pypdfium2 usa 72 DPI como base padrão, calculamos a escala para 300 DPI
-        escala = dpi / 72.0
-
-        for i in range(len(pdf)):
-            pagina = pdf[i]
-            bitmap = pagina.render(scale=escala)
-            img = bitmap.to_pil()
-            imagens.append(img)
-            
-        print(f"📑 Total de páginas identificadas: {len(imagens)}\n")
-        return imagens
-    except Exception as e:
-        print(f"❌ Erro ao ler o arquivo: {e}")
-        return []
-
-
 def corrigir_inclinacao(cinza: np.ndarray) -> np.ndarray:
     """
     Detecta a inclinação do texto e rotaciona a imagem para corrigi-la.
@@ -131,59 +97,129 @@ def verificar_assinatura(imagem_processada: np.ndarray) -> bool:
     Localiza a área de assinatura via OCR (múltiplas âncoras) ou usa Fallback Geométrico.
     """
     altura_imagem, largura_imagem = imagem_processada.shape
-    metade_y = int(altura_imagem * 0.5)
+    limite_y_assinatura = int(altura_imagem * 0.75)
 
     dados_ocr = pytesseract.image_to_data(imagem_processada, output_type=pytesseract.Output.DICT, lang='por')
     n_boxes = len(dados_ocr['text'])
     
+    # 1. MÁSCARA DE EXCLUSÃO DE RODAPÉ (LIMPEZA SELETIVA)
+    limite_max_y = altura_imagem
+    
+    # Âncoras universais (nunca usar nomes próprios de funcionários)
+    termos_rodape_exatos = {'pág', 'pag', 'pág.', 'pag.', 'por:'}
+    metade_y = int(altura_imagem * 0.5)
+    
+    for i in range(n_boxes):
+        texto_box = dados_ocr['text'][i].strip().lower()
+        if not texto_box:
+            continue
+        
+        # Identifica o rodapé de forma exata ou pela palavra-chave 'impresso' ou 'emitido'
+        if texto_box in termos_rodape_exatos or 'impresso' in texto_box or 'pág' in texto_box or 'emitido' in texto_box:
+            y = dados_ocr['top'][i]
+            # Considera apenas se estiver na metade inferior da página (para não apagar o topo por engano)
+            if y > metade_y:
+                # Puxa a margem 50 pixels para cima (Y - 50) para garantir que engloba a linha toda
+                limite_max_y = min(limite_max_y, max(0, y - 50))
+                
+    # Pinta de branco um retângulo que cubra toda a largura da página, da altura do texto do rodapé encontrado até o fim da imagem.
+    if limite_max_y < altura_imagem:
+        imagem_processada[limite_max_y:, :] = 255
+
     # Múltiplas âncoras para não depender de ler apenas a palavra "assinatura"
     ancoras = ['assinatura', 'assina', 'tutor', 'proprietário', 'proprietario', 'responsável', 'responsavel']
+    ancora_encontrada = False
     
     for i in range(n_boxes):
         y = dados_ocr['top'][i]
         
-        if y < metade_y:
+        if y < limite_y_assinatura or y >= limite_max_y:
             continue
 
         texto_box = dados_ocr['text'][i].strip().lower()
         
         if any(ancora in texto_box for ancora in ancoras):
+            ancora_encontrada = True
             x, y = dados_ocr['left'][i], dados_ocr['top'][i]
             w, h = dados_ocr['width'][i], dados_ocr['height'][i]
+            
             
             roi_h = 150 
             roi_y = max(0, y - roi_h - 20) 
             roi_w = max(w * 3, 200) 
             roi_x = max(0, x - int((roi_w - w) / 2)) 
             
+            
             area_assinatura = imagem_processada[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
             total_pixels = area_assinatura.size
             if total_pixels == 0:
                 continue
 
-            pixels_brancos = cv2.countNonZero(area_assinatura)
-            pixels_pretos = total_pixels - pixels_brancos
-            densidade_tinta = pixels_pretos / total_pixels
+            # Limpeza de ruído na ROI
+            area_assinatura = cv2.medianBlur(area_assinatura, 3)
+
+            # Inversão para operações morfológicas (fundo preto, traços brancos)
+            area_inv = cv2.bitwise_not(area_assinatura)
             
-            if densidade_tinta > 0.015:
+            # 1. Remoção de Linhas Horizontais (Filtro Morfológico)
+            kernel_horizontal = cv2.getStructuringElement(cv2.MORPH_RECT, (80, 1))
+            linhas_detectadas = cv2.morphologyEx(area_inv, cv2.MORPH_OPEN, kernel_horizontal)
+            area_limpa_inv = cv2.subtract(area_inv, linhas_detectadas)
+
+            # 2. Detecção de Formas (Contornos Estritos)
+            contornos, _ = cv2.findContours(area_limpa_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            maior_contorno = 0
+            
+            for c in contornos:
+                area_c = cv2.contourArea(c)
+                if area_c > maior_contorno:
+                    maior_contorno = area_c
+                    
+            
+            if maior_contorno > 300:
                 return True
                 
-    # --- FALLBACK GEOMÉTRICO ---
-    # Se o Tesseract não ler nenhuma âncora, recorta os 15% inferiores e 50% direitos da página
-    corte_y_fallback = int(altura_imagem * 0.85)
-    corte_x_fallback = int(largura_imagem * 0.50)
-    
-    area_fallback = imagem_processada[corte_y_fallback:altura_imagem, corte_x_fallback:largura_imagem]
-    total_pixels_fall = area_fallback.size
-    
-    if total_pixels_fall > 0:
-        pixels_brancos_fall = cv2.countNonZero(area_fallback)
-        pixels_pretos_fall = total_pixels_fall - pixels_brancos_fall
-        densidade_fall = pixels_pretos_fall / total_pixels_fall
+    if not ancora_encontrada:
+
+        # --- FALLBACK GEOMÉTRICO ---
+        # Usa o limite_max_y (onde começa o rodapé) para definir o fundo da busca
+        corte_y_fallback_fim = limite_max_y
+        corte_y_fallback_inicio = max(0, limite_max_y - 250) # Pega 250 pixels acima do rodapé
+        corte_x_fallback_inicio = int(largura_imagem * 0.10) # Começa nos 10% da esquerda
+        corte_x_fallback_fim = int(largura_imagem * 0.95)
         
-        if densidade_fall > 0.015:
-            return True
+        
+        if corte_y_fallback_inicio < corte_y_fallback_fim:
+            area_fallback = imagem_processada[corte_y_fallback_inicio:corte_y_fallback_fim, corte_x_fallback_inicio:corte_x_fallback_fim]
+            total_pixels_fall = area_fallback.size
             
+            if total_pixels_fall > 0:
+                # Limpeza de ruído na ROI de fallback
+                area_fallback = cv2.medianBlur(area_fallback, 3)
+
+                # Inversão para operações morfológicas
+                area_fall_inv = cv2.bitwise_not(area_fallback)
+                
+                # 1. Remoção de Linhas Horizontais
+                kernel_horizontal_fall = cv2.getStructuringElement(cv2.MORPH_RECT, (80, 1))
+                linhas_detectadas_fall = cv2.morphologyEx(area_fall_inv, cv2.MORPH_OPEN, kernel_horizontal_fall)
+                area_limpa_fall_inv = cv2.subtract(area_fall_inv, linhas_detectadas_fall)
+                
+                # 2. Validação Estrita por Contornos
+                contornos_fall, _ = cv2.findContours(area_limpa_fall_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                maior_contorno_fall = 0
+                
+                for c in contornos_fall:
+                    area_c_fall = cv2.contourArea(c)
+                    if area_c_fall > maior_contorno_fall:
+                        maior_contorno_fall = area_c_fall
+                        
+                
+                if maior_contorno_fall > 300:
+                    return True
+    
     return False
 
 
@@ -206,7 +242,7 @@ def limpar_valor(texto: str) -> str:
         r'impresso.*', r'p[áa]g\w*', r'crmv.*', r'dados do animal', r'doc\.*', 
         r'identifica[çc][ãa]o', r'inscri[çc][ãa]o', r'm[eé]dic[oa].*veterin[aá]ri[oa]', 
         r'animai', r'aniniai', r'peito', r'abaixo\s*identificado', r'abaixo\s*[wvw]entificado',
-        r'abaixo\s*aser', r'\bpala\b', r'\bpero\b'
+        r'abaixo\s*aser', r'\bpala\b', r'\bpero\b', r'\bcpe\b'
     ]
     padrao = r'(?i)\b(?:' + '|'.join(termos_remover) + r')\b'
     texto_limpo = re.sub(padrao, '', str(texto))
@@ -268,29 +304,34 @@ def validar_cpf(cpf_str: str) -> bool:
 
 
 def parsear_dados_do_texto(texto: str) -> dict:
-    """Extração cirúrgica baseada na estrutura real do formulário SEPDA."""
     dados = {
+        "Tipo de Termo": "Não identificado",
         "Nome Completo": "Não identificado",
         "CPF": "CPF não identificado",
         "Nome do Animal": "Não identificado",
         "Espécie": "Não identificado"
     }
 
-    # Transforma o texto em lista de linhas para facilitar a busca por vizinhança
     linhas = [l.strip() for l in texto.split('\n') if l.strip()]
     
-    # 1. BUSCA DO CPF (Âncora Principal)
+    # --- IDENTIFICAÇÃO DO TIPO DE TERMO (CABEÇALHO) ---
+    trecho_topo = " ".join(linhas[:15])
+    if re.search(r'(?i)cir[uú]rgico', trecho_topo):
+        dados["Tipo de Termo"] = "Cirúrgico"
+    elif re.search(r'(?i)antiparasit[aá]rio', trecho_topo):
+        dados["Tipo de Termo"] = "Antiparasitário"
+    elif re.search(r'(?i)anest[eé]sicos?', trecho_topo):
+        dados["Tipo de Termo"] = "Anestésico"
+
+    # 1. BUSCA DO CPF (Âncora Principal - Funciona para todos os layouts)
     cpf_linha_idx = -1
     for i, linha in enumerate(linhas):
-        # Filtro Anti-Falsos Positivos: Evita concatenar números de endereço/telefone que coincidam com um CPF válido
         if re.search(r'(?i)\b(?:cep|quadra|lote|conjunto|casa|setor|rua|avenida|residente|bairro|endere[çc]o|tel|telefone|celular|cel)\b', linha):
-            # Só ignora a linha se ela NÃO tiver a palavra 'CPF' explícita
             if not re.search(r'(?i)\bcpf\b', linha):
                 continue
                 
         num_limpo = re.sub(r'\D', '', linha)
         if len(num_limpo) >= 11:
-            # Testa janelas de 11 dígitos iterativamente para tolerar caracteres extras lidos pelo OCR
             encontrou_valido = False
             for j in range(len(num_limpo) - 10):
                 num_cpf = num_limpo[j:j+11]
@@ -298,6 +339,7 @@ def parsear_dados_do_texto(texto: str) -> dict:
                     dados["CPF"] = f"{num_cpf[:3]}.{num_cpf[3:6]}.{num_cpf[6:9]}-{num_cpf[9:]}"
                     encontrou_valido = True
                     cpf_linha_idx = i
+                    print(f"    [LOG] CPF matemático válido capturado: {dados['CPF']}")
                     break
             
             if encontrou_valido:
@@ -305,70 +347,77 @@ def parsear_dados_do_texto(texto: str) -> dict:
             elif dados["CPF"] == "CPF não identificado" and len(num_limpo) == 11:
                 dados["CPF"] = "CPF Inválido"
                 cpf_linha_idx = i
-                print(f"  ⚠️ Alerta: Ignorando numeração semelhante a CPF (inválida): {num_limpo[:11]}")
 
-    # 2. BUSCA DO NOME (Tutor)
-    for i, linha in enumerate(linhas):
-        # Ignora linhas de rodapé, observações, carimbos médicos ou "assinatura"
-        if re.search(r'(?i)(?:observaç[õo]es|impresso|p[áa]g|assinatura|pelo\s+animal|crmv)', linha):
-            continue
+    # --- 2. VIA RÁPIDA: NOVO LAYOUT ESTRUTURADO (OMNI / Lista) ---
+    for linha in linhas:
+        match_animal = re.search(r'(?i)^Animal:\s*(?:\d+\s*-\s*)?(.+)', linha)
+        if match_animal and dados["Nome do Animal"] == "Não identificado":
+            dados["Nome do Animal"] = limpar_valor(match_animal.group(1))
+
+        match_especie = re.search(r'(?i)^Esp[eéè]cie:\s*(.+)', linha)
+        if match_especie and dados["Espécie"] == "Não identificado":
+            dados["Espécie"] = limpar_valor(match_especie.group(1))
+
+        match_tutor = re.search(r'(?i)^Respons[aá]vel:\s*(?:\d+\s*-\s*)?(.+)', linha)
+        if match_tutor and dados["Nome Completo"] == "Não identificado":
+            dados["Nome Completo"] = limpar_valor(match_tutor.group(1))
             
-        # Filtro Anti-Animal: Impede que a linha com os dados do pet seja lida como tutor se começar apenas com "Nome:"
-        if re.search(r'(?i)\b(?:felin[oa]|canin[oa]|f[êe]mea|macho|nascid[oa]|pelagem|srd|kg|chip)\b', linha):
-            continue
-            
-        # Busca RIGOROSA pelo tutor (Adicionado 'nome\b' para capturar rótulos simples no topo)
-        match_tutor = re.search(r'(?i)^(?:nome.*completo|nome\s+do\s+(?:tutor|respons[áa]vel|propriet[áa]rio)|tutor|propriet[áa]rio|respons[áa]vel|cliente|nome\b)[\s:\-.]*(.*)', linha)
-        if match_tutor:
-            candidato = match_tutor.group(1).strip()
-            nome_limpo = limpar_valor(candidato)
-            
-            if nome_limpo != "Não identificado":
-                dados["Nome Completo"] = nome_limpo
-                break
-            elif i + 1 < len(linhas):
-                nome_limpo_abaixo = limpar_valor(linhas[i+1])
-                if nome_limpo_abaixo != "Não identificado":
-                    dados["Nome Completo"] = nome_limpo_abaixo
+        match_nome = re.search(r'(?i)^Nome:\s*(.+)', linha)
+        if match_nome and dados["Nome Completo"] == "Não identificado":
+            candidato = limpar_valor(match_nome.group(1))
+            if candidato != "Não identificado" and len(candidato.split()) > 1:
+                dados["Nome Completo"] = candidato
+
+        match_animal_inline = re.search(r'(?i)\bNome\s+([^,]+),\s*esp[eéè]cie', linha)
+        if match_animal_inline and dados["Nome do Animal"] == "Não identificado":
+            dados["Nome do Animal"] = limpar_valor(match_animal_inline.group(1))
+
+    # --- 3. FALLBACK: LAYOUT ANTIGO (Texto Corrido / Parágrafos) ---
+    if dados["Nome Completo"] == "Não identificado":
+        for i, linha in enumerate(linhas):
+            if re.search(r'(?i)(?:observaç[õo]es|impresso|p[áa]g|assinatura|pelo\s+animal|crmv)', linha):
+                continue
+            if re.search(r'(?i)\b(?:felin[oa]|canin[oa]|f[êe]mea|macho|nascid[oa]|pelagem|srd|kg|chip)\b', linha):
+                continue
+                
+            match_tutor = re.search(r'(?i)^(?:nome.*completo|nome\s+do\s+(?:tutor|respons[áa]vel|propriet[áa]rio)|tutor|propriet[áa]rio|respons[áa]vel|cliente|nome\b)[\s:\-.]*(.*)', linha)
+            if match_tutor:
+                candidato = match_tutor.group(1).strip()
+                nome_limpo = limpar_valor(candidato)
+                if nome_limpo != "Não identificado":
+                    dados["Nome Completo"] = nome_limpo
+                    break
+                elif i + 1 < len(linhas):
+                    nome_limpo_abaixo = limpar_valor(linhas[i+1])
+                    if nome_limpo_abaixo != "Não identificado":
+                        dados["Nome Completo"] = nome_limpo_abaixo
+                        break
+
+        if dados["Nome Completo"] == "Não identificado" and cpf_linha_idx > 0 and dados["CPF"] not in ["CPF Inválido", "CPF não identificado"]:
+            for j in range(cpf_linha_idx - 1, max(-1, cpf_linha_idx - 4), -1):
+                candidato = limpar_valor(linhas[j])
+                if candidato != "Não identificado" and not re.search(r'(?i)(?:cpf|rg|doc)', linhas[j]):
+                    dados["Nome Completo"] = candidato
                     break
 
-    # Fallback Imbatível do Nome: Se o rótulo falhou, captura a linha diretamente acima do CPF.
-    # IMPORTANTE: Só ativa o fallback se o CPF for VÁLIDO. Evita âncoras falsas de telefones/CEPs.
-    if dados["Nome Completo"] == "Não identificado" and cpf_linha_idx > 0 and dados["CPF"] not in ["CPF Inválido", "CPF não identificado"]:
-        for j in range(cpf_linha_idx - 1, max(-1, cpf_linha_idx - 4), -1):
-            candidato = limpar_valor(linhas[j])
-            # Evita capturar RGs soltos
-            if candidato != "Não identificado" and not re.search(r'(?i)(?:cpf|rg|doc)', linhas[j]):
-                dados["Nome Completo"] = candidato
-                break
-
-    # 3. BUSCA DO ANIMAL E ESPÉCIE 
-    # Bloco Independente com Âncora à Prova de Balas
-    for i, linha in enumerate(linhas):
-        # Gatilho Flexível: Ativa por "identificação" ou diretamente pela palavra "espécie"
-        if re.search(r'(?i)(?:identifica[çc][ãa]o|dados\s+do\s+animal|paciente|esp[eéè]cie)', linha):
-            # Olha a linha atual e as 6 seguintes
-            busca_area = " \n ".join(linhas[i:i+7]) 
-            
-            # Imunidade a "Identificação do Proprietário": se ativou por identificação mas não tem palavras de pet, ignora
-            if "identifica" in linha.lower() and not re.search(r'(?i)(?:esp[eéè]cie|ra[çc]a|pelagem|sexo|idade|f[êe]mea|macho)', busca_area):
-                continue
-            
-            # Extrai Animal: Lookahead negativo (?!\s+completo) impede de engolir a linha do tutor
-            match_animal = re.search(r'(?i)\bnome\b(?!\s+completo)[\s:\-.]*([A-Za-zÀ-ú\s]+?)(?:[\n,]|esp[eéè]cie|ra[çc]a|sexo|idade|f[êe]mea|macho|nascid[oa]|pelagem)', busca_area)
-            if match_animal:
-                dados["Nome do Animal"] = limpar_valor(match_animal.group(1))
+    if dados["Nome do Animal"] == "Não identificado" or dados["Espécie"] == "Não identificado":
+        for i, linha in enumerate(linhas):
+            if re.search(r'(?i)(?:identifica[çc][ãa]o|dados\s+do\s+animal|paciente|esp[eéè]cie)', linha):
+                busca_area = " \n ".join(linhas[i:i+7]) 
+                if "identifica" in linha.lower() and not re.search(r'(?i)(?:esp[eéè]cie|ra[çc]a|pelagem|sexo|idade|f[êe]mea|macho)', busca_area):
+                    continue
                 
-            # Extrai Espécie com os mesmos bloqueios
-            match_especie = re.search(r'(?i)esp[eéè]cie[\s:\-.]*([A-Za-zÀ-ú\s]+?)(?:[\n,]|$|ra[çc]a|sexo|idade|f[êe]mea|macho|nascid[oa]|pelagem)', busca_area)
-            if match_especie:
-                dados["Espécie"] = limpar_valor(match_especie.group(1))
-            
-            if dados["Nome do Animal"] != "Não identificado" or dados["Espécie"] != "Não identificado":
-                break
-            
-    # 4. FALLBACK PLANO B: ESPÉCIE
-    # Busca a Espécie isoladamente em qualquer linha, caso tenha falhado
+                match_animal = re.search(r'(?i)\bnome\b(?!\s+completo)[\s:\-.]*([A-Za-zÀ-ú\s]+?)(?:[\n,\(]|esp[eéè]cie|ra[çc]a|sexo|idade|f[êe]mea|macho|nascid[oa]|pelagem|kg|peso|\bem\b)', busca_area)
+                if match_animal and dados["Nome do Animal"] == "Não identificado":
+                    dados["Nome do Animal"] = limpar_valor(match_animal.group(1))
+                    
+                match_especie = re.search(r'(?i)esp[eéè]cie[\s:\-.]*([A-Za-zÀ-ú\s]+?)(?:[\n,]|$|ra[çc]a|sexo|idade|f[êe]mea|macho|nascid[oa]|pelagem)', busca_area)
+                if match_especie and dados["Espécie"] == "Não identificado":
+                    dados["Espécie"] = limpar_valor(match_especie.group(1))
+                
+                if dados["Nome do Animal"] != "Não identificado" or dados["Espécie"] != "Não identificado":
+                    break
+                    
     if dados["Espécie"] == "Não identificado":
         for linha in linhas:
             match_especie_fallback = re.search(r'(?i)esp[eéè]cie\s*[:\-]?\s*([A-Za-zÀ-ú\s]+)', linha)
@@ -377,15 +426,18 @@ def parsear_dados_do_texto(texto: str) -> dict:
                 if especie_limpa != "Não identificado":
                     dados["Espécie"] = especie_limpa
                     break
-                    
-    # --- VALIDAÇÃO FINAL ANTI-CROSS-CAPTURE ---
-    # Se o nome do animal for idêntico ao do tutor (ou englobá-lo), descarta o animal para evitar duplicação irreal
+
+    # --- LIMPEZA ESPECÍFICA DE RUÍDOS NO NOME DO ANIMAL ---
+    if dados["Nome do Animal"] not in ["Não identificado"]:
+        # Remove 'Kg', 'Em', 'Canina Fêmea', parênteses e outras sujeiras específicas
+        animal_limpo = re.sub(r'(?i)(\bkg\b|\bem\b|\bcanin[oa]\b|\bfelin[oa]\b|\bf[eê]mea\b|\bmach[oa]\b|\bpeso\b|\(|\))', '', dados["Nome do Animal"])
+        animal_limpo = re.sub(r'\s+', ' ', animal_limpo).strip()
+        dados["Nome do Animal"] = animal_limpo if len(animal_limpo) >= 2 else "Não identificado"
+
+    # --- VALIDAÇÃO FINAL ---
     if dados["Nome Completo"] != "Não identificado" and dados["Nome do Animal"] == dados["Nome Completo"]:
-        print(f"  ⚠️ Alerta: Pet e Tutor com mesmo nome. Omitindo pet (possível falso positivo).")
         dados["Nome do Animal"] = "Não identificado"
 
-    # --- PADRONIZAÇÃO DE TEXTO (TITLE CASE) ---
-    # Formata os nomes para ficarem bonitos no Excel (ex: 'leo' -> 'Leo', 'MALU' -> 'Malu')
     excecoes_prep = ['de', 'da', 'do', 'das', 'dos', 'e']
     for chave in ["Nome Completo", "Nome do Animal", "Espécie"]:
         if dados[chave] not in ["Não identificado", "CPF não identificado", "CPF Inválido"]:
@@ -420,18 +472,181 @@ def processar_pdf_formularios(caminho_pdf: str, progresso_callback=None, itens_r
     """
     Processa o PDF, extrai os dados, aplica OCR de 2ª chance e alimenta os Bancos de Dados.
     """
-    imagens_pil = converter_pdf_para_imagens(caminho_pdf, DPI_CONVERSAO)
-    if not imagens_pil:
+    nome_arquivo = os.path.basename(caminho_pdf)
+    diretorio_base = os.path.dirname(caminho_pdf)
+    revisao_manual_path = os.path.join(diretorio_base, 'REVISAO_MANUAL_CASTRA.xlsx')
+    
+    mapa_arquivos = {
+        'Cirúrgico': 'BANCO_MESTRE_CIRURGICO.xlsx',
+        'Antiparasitário': 'BANCO_MESTRE_ANTIPARASITARIO.xlsx',
+        'Anestésico': 'BANCO_MESTRE_ANESTESICO.xlsx',
+        'Não identificado': 'BANCO_MESTRE_NAO_IDENTIFICADO.xlsx'
+    }
+
+    print(f"📂 ARQUIVO: {nome_arquivo}")
+
+    try:
+        pdf = pdfium.PdfDocument(caminho_pdf)
+        total_paginas = len(pdf)
+        print(f"📑 Total de páginas identificadas: {total_paginas}\n")
+    except Exception as e:
+        print(f"❌ Erro ao ler o arquivo: {e}")
         return
 
-    dados_coletados = []
-    total_paginas = len(imagens_pil)
+    # --- LÓGICA DE RESUMO AUTOMÁTICO ---
+    paginas_processadas = set()
     
-    for i, imagem_pil in enumerate(imagens_pil):
-        print(f"📄 PÁGINA {i+1} / {total_paginas}")
-        print("━" * 45)
+    # Verifica páginas já concluídas em todos os Bancos Mestres
+    for arquivo_banco in mapa_arquivos.values():
+        banco_mestre_path = os.path.join(diretorio_base, arquivo_banco)
+        if os.path.exists(banco_mestre_path):
+            try:
+                df_m = pd.read_excel(banco_mestre_path)
+                if 'Arquivo Origem' in df_m.columns and 'Página' in df_m.columns:
+                    paginas_processadas.update(df_m[df_m['Arquivo Origem'] == nome_arquivo]['Página'].dropna().astype(int).tolist())
+            except Exception: pass
+        
+    # Verifica páginas já concluídas no Relatório de Erros
+    if os.path.exists(revisao_manual_path):
+        try:
+            df_r = pd.read_excel(revisao_manual_path)
+            if 'Arquivo Origem' in df_r.columns and 'Página' in df_r.columns:
+                paginas_processadas.update(df_r[df_r['Arquivo Origem'] == nome_arquivo]['Página'].dropna().astype(int).tolist())
+        except Exception: pass
+
+    if len(paginas_processadas) >= total_paginas:
+        print(f"✅ Arquivo já foi 100% processado anteriormente. Pulando...\n")
+        if progresso_callback:
+            progresso_callback(total_paginas, total_paginas)
+        return
+    elif paginas_processadas:
+        print(f"🔄 Retomando processamento... {len(paginas_processadas)} páginas já lidas foram ignoradas.\n")
+
+    dados_coletados = []
+    escala = DPI_CONVERSAO / 72.0
+
+    def salvar_dados_parciais():
+        """Função aninhada para salvar dados no disco periodicamente e liberar RAM"""
+        if not dados_coletados:
+            return
+            
+        print("💾 Sincronizando dados com as planilhas do sistema...")
+        df_novo = pd.DataFrame(dados_coletados)
+        df_mestre_check_all = pd.DataFrame()
+        
+        # 1. Atualizar Bancos Mestres (Separados por Tipo)
+        tipos_presentes = df_novo['Tipo de Termo'].unique()
+        
+        for tipo in tipos_presentes:
+            df_tipo = df_novo[df_novo['Tipo de Termo'] == tipo].copy()
+            nome_arquivo_banco = mapa_arquivos.get(tipo, 'BANCO_MESTRE_NAO_IDENTIFICADO.xlsx')
+            banco_path = os.path.join(diretorio_base, nome_arquivo_banco)
+            
+            df_mestre_check = pd.DataFrame()
+            if os.path.exists(banco_path):
+                try:
+                    df_mestre = pd.read_excel(banco_path)
+                    df_mestre_check = df_mestre.copy()
+                    df_final = pd.concat([df_mestre, df_tipo], ignore_index=True)
+                except Exception:
+                    df_final = df_tipo.copy()
+            else:
+                df_final = df_tipo.copy()
+                
+            df_mestre_check_all = pd.concat([df_mestre_check_all, df_mestre_check], ignore_index=True)
+
+            # Remove Duplicados
+            mascara_validos = (df_final['CPF'] != 'CPF não identificado') & (df_final['CPF'] != 'Não identificado') & (df_final['CPF'] != 'CPF Inválido')
+            colunas_dup = [c for c in ['Nome Completo', 'CPF', 'Nome do Animal', 'Tipo de Termo'] if c in df_final.columns]
+            duplicados = df_final[mascara_validos].duplicated(subset=colunas_dup, keep='last')
+            df_final = df_final.drop(duplicados[duplicados].index)
+            
+            colunas_ordem = ['Arquivo Origem', 'Página', 'Tipo de Termo', 'Nome Completo', 'CPF', 'Nome do Animal', 'Espécie', 'Assinatura Presente']
+            df_final = df_final[[col for col in colunas_ordem if col in df_final.columns]]
+            
+            try:
+                df_final.to_excel(banco_path, index=False, engine='openpyxl')
+            except Exception as e:
+                print(f"❌ Erro ao salvar base acumulada ({tipo}): {e}")
+
+        # 2. Relatório de Inconsistências (Revisão Humana)
+        erros_list = []
+        vistos_lote = {}
+        for _, row in df_novo.iterrows():
+            motivos = []
+            if row.get('Tipo de Termo') == "Não identificado": motivos.append("Tipo não identificado")
+            if row.get('Nome Completo') == "Não identificado": motivos.append("Nome Ausente/Ilegível")
+            if row.get('CPF') in ["CPF não identificado", "CPF Inválido", "Não identificado"]: motivos.append("CPF Ausente/Inválido")
+            if row.get('Nome do Animal') == "Não identificado": motivos.append("Animal Ausente/Ilegível")
+            if row.get('Espécie') == "Não identificado": motivos.append("Espécie Ausente/Ilegível")
+            if row.get('Assinatura Presente') == "Não": motivos.append("Assinatura Pendente")
+            
+            is_dup = False
+            cpf_valido = row.get('CPF') not in ["CPF não identificado", "CPF Inválido", "Não identificado"]
+            if cpf_valido:
+                cpf = row.get('CPF')
+                animal = row.get('Nome do Animal')
+                nome = row.get('Nome Completo')
+                tipo = row.get('Tipo de Termo')
+                chave_dup = (nome, cpf, animal, tipo)
+                
+                if not df_mestre_check_all.empty and all(c in df_mestre_check_all.columns for c in ['Nome Completo', 'CPF', 'Nome do Animal', 'Tipo de Termo']):
+                    match = (df_mestre_check_all['Nome Completo'] == nome) & (df_mestre_check_all['CPF'] == cpf) & (df_mestre_check_all['Nome do Animal'] == animal) & (df_mestre_check_all['Tipo de Termo'] == tipo)
+                    if match.any(): 
+                        is_dup = True
+                        row_match = df_mestre_check_all[match].iloc[0]
+                        motivos.append(f"Registro Duplicado (Arq: {row_match.get('Arquivo Origem', '?')}, Pág: {row_match.get('Página', '?')})")
+                
+                if not is_dup:
+                    if chave_dup in vistos_lote:
+                        arq_dup, pag_dup = vistos_lote[chave_dup]
+                        motivos.append(f"Registro Duplicado (Arq: {arq_dup}, Pág: {pag_dup})")
+                    else:
+                        vistos_lote[chave_dup] = (row.get('Arquivo Origem'), row.get('Página'))
+
+            if motivos:
+                dict_erro = row.to_dict()
+                dict_erro['Motivo da Falha'] = " | ".join(motivos)
+                erros_list.append(dict_erro)
+
+        if itens_revisao_callback:
+            itens_revisao_callback(len(erros_list))
+
+        if erros_list:
+            df_erros = pd.DataFrame(erros_list)
+            if os.path.exists(revisao_manual_path):
+                try:
+                    df_revisao_antigo = pd.read_excel(revisao_manual_path)
+                    df_revisao_final = pd.concat([df_revisao_antigo, df_erros], ignore_index=True)
+                except Exception:
+                    df_revisao_final = df_erros
+            else:
+                df_revisao_final = df_erros
+            
+            try:
+                df_revisao_final = df_revisao_final.drop_duplicates(subset=['CPF', 'Nome do Animal', 'Motivo da Falha', 'Arquivo Origem'], keep='last')
+                df_revisao_final.to_excel(revisao_manual_path, index=False, engine='openpyxl')
+            except Exception: pass
+
+        # Limpa os dados parciais da memória após salvá-los no disco
+        dados_coletados.clear()
+    
+    for i in range(total_paginas):
+        pagina_atual = i + 1
         if progresso_callback:
             progresso_callback(i, total_paginas)
+
+        if pagina_atual in paginas_processadas:
+            print(f"⏭️ PÁGINA {pagina_atual} / {total_paginas} (Já processada, ignorando...)")
+            continue
+
+        print(f"📄 PÁGINA {pagina_atual} / {total_paginas}")
+        print("━" * 45)
+
+        pagina = pdf[i]
+        bitmap = pagina.render(scale=escala)
+        imagem_pil = bitmap.to_pil()
+        pagina.close()
 
         # 1. Pré-processamento e corte
         imagem_processada = pre_processar_imagem_para_ocr(imagem_pil)
@@ -455,13 +670,15 @@ def processar_pdf_formularios(caminho_pdf: str, progresso_callback=None, itens_r
             if dados_inv["Nome Completo"] != "Não identificado":
                 dados_pagina["Nome Completo"] = dados_inv["Nome Completo"]
 
-        dados_pagina["Página"] = i + 1
+        dados_pagina["Página"] = pagina_atual
+        dados_pagina["Arquivo Origem"] = nome_arquivo
 
         # 5. Assinatura
         assinatura_presente = verificar_assinatura(imagem_processada)
         dados_pagina["Assinatura Presente"] = "Sim" if assinatura_presente else "Não"
 
         status_ass = "✅ Identificada" if assinatura_presente else "❌ Não identificada"
+        print(f"  📄 Tipo:       {dados_pagina.get('Tipo de Termo', '')}")
         print(f"  👤 Tutor:      {dados_pagina.get('Nome Completo', '')}")
         print(f"  🪪 CPF:        {dados_pagina.get('CPF', '')}")
         print(f"  🐾 Pet:        {dados_pagina.get('Nome do Animal', '')} ({dados_pagina.get('Espécie', '')})")
@@ -469,113 +686,20 @@ def processar_pdf_formularios(caminho_pdf: str, progresso_callback=None, itens_r
         print("━" * 45 + "\n")
         dados_coletados.append(dados_pagina)
 
+        # Limpa da memória os objetos pesados do processamento atual
+        del imagem_pil
+        del imagem_processada
+        del bitmap
+
+        # Salva o progresso a cada 10 páginas para garantir o resume em caso de interrupção
+        if pagina_atual % 10 == 0:
+            salvar_dados_parciais()
+
     if progresso_callback:
         progresso_callback(total_paginas, total_paginas)
 
-    if not dados_coletados:
-        return
-
-    # --- INTELIGÊNCIA DE BANCO DE DADOS LOCAL ---
-    print("💾 Sincronizando dados com as planilhas do sistema...")
-    df_novo = pd.DataFrame(dados_coletados)
-    
-    diretorio_base = os.path.dirname(caminho_pdf)
-    nome_arquivo = os.path.basename(caminho_pdf)
-    banco_mestre_path = os.path.join(diretorio_base, 'BANCO_MESTRE_CASTRA.xlsx')
-    revisao_manual_path = os.path.join(diretorio_base, 'REVISAO_MANUAL_CASTRA.xlsx')
-
-    # 1. Atualizar Banco Mestre (Acumulado)
-    df_mestre_check = pd.DataFrame()
-    if os.path.exists(banco_mestre_path):
-        try:
-            df_mestre = pd.read_excel(banco_mestre_path)
-            df_mestre_check = df_mestre.copy()
-            df_final = pd.concat([df_mestre, df_novo], ignore_index=True)
-        except Exception:
-            df_final = df_novo.copy()
-    else:
-        df_final = df_novo.copy()
-
-    # Remove Duplicados (CPF e Nome do Animal), protegendo os não identificados contra deleção em massa
-    mascara_validos = (df_final['CPF'] != 'CPF não identificado') & (df_final['CPF'] != 'Não identificado') & (df_final['CPF'] != 'CPF Inválido')
-    duplicados = df_final[mascara_validos].duplicated(subset=['CPF', 'Nome do Animal'], keep='last')
-    df_final = df_final.drop(duplicados[duplicados].index)
-    
-    colunas_ordem = ['Página', 'Nome Completo', 'CPF', 'Nome do Animal', 'Espécie', 'Assinatura Presente']
-    df_final = df_final[[col for col in colunas_ordem if col in df_final.columns]]
-    
-    try:
-        df_final.to_excel(banco_mestre_path, index=False, engine='openpyxl')
-        print(f"✅ Base acumulada atualizada: {banco_mestre_path}")
-    except Exception as e:
-        print(f"❌ Erro ao salvar base acumulada: {e}")
-
-    # 2. Relatório de Inconsistências (Revisão Humana)
-    erros_list = []
-    vistos_lote = set()
-    for _, row in df_novo.iterrows():
-        motivos = []
-        if row.get('Nome Completo') == "Não identificado":
-            motivos.append("Nome Ausente/Ilegível")
-        if row.get('CPF') in ["CPF não identificado", "CPF Inválido", "Não identificado"]:
-            motivos.append("CPF Ausente/Inválido")
-        if row.get('Nome do Animal') == "Não identificado":
-            motivos.append("Animal Ausente/Ilegível")
-        if row.get('Espécie') == "Não identificado":
-            motivos.append("Espécie Ausente/Ilegível")
-        if row.get('Assinatura Presente') == "Não":
-            motivos.append("Assinatura Pendente")
-        
-        # Verifica duplicidade (cruzando com banco mestre existente e com o lote atual)
-        is_dup = False
-        cpf_valido = row.get('CPF') not in ["CPF não identificado", "CPF Inválido", "Não identificado"]
-        if cpf_valido:
-            cpf = row.get('CPF')
-            animal = row.get('Nome do Animal')
-            if not df_mestre_check.empty and 'CPF' in df_mestre_check.columns and 'Nome do Animal' in df_mestre_check.columns:
-                match = (df_mestre_check['CPF'] == cpf) & (df_mestre_check['Nome do Animal'] == animal)
-                if match.any():
-                    is_dup = True
-            
-            if (cpf, animal) in vistos_lote:
-                is_dup = True
-            else:
-                vistos_lote.add((cpf, animal))
-
-        if is_dup:
-            motivos.append("Registro Duplicado")
-
-        if motivos:
-            dict_erro = row.to_dict()
-            dict_erro['Motivo da Falha'] = " | ".join(motivos)
-            dict_erro['Arquivo Origem'] = nome_arquivo
-            erros_list.append(dict_erro)
-
-    if itens_revisao_callback:
-        itens_revisao_callback(len(erros_list))
-
-    if erros_list:
-        df_erros = pd.DataFrame(erros_list)
-        if os.path.exists(revisao_manual_path):
-            try:
-                df_revisao_antigo = pd.read_excel(revisao_manual_path)
-                df_revisao_final = pd.concat([df_revisao_antigo, df_erros], ignore_index=True)
-            except Exception:
-                df_revisao_final = df_erros
-        else:
-            df_revisao_final = df_erros
-        
-        # Deduplicação do relatório de erros
-        try:
-            df_revisao_final = df_revisao_final.drop_duplicates(subset=['CPF', 'Nome do Animal', 'Motivo da Falha', 'Arquivo Origem'], keep='last')
-        except Exception:
-            pass
-        
-        try:
-            df_revisao_final.to_excel(revisao_manual_path, index=False, engine='openpyxl')
-            print(f"⚠️ Relatório de revisão gerado: {revisao_manual_path}")
-        except Exception as e:
-            print(f"❌ Erro ao salvar relatório de revisão: {e}")
+    # Salva eventuais dados restantes no fim do arquivo
+    salvar_dados_parciais()
 
 
 def iniciar_gui():
@@ -589,6 +713,55 @@ def iniciar_gui():
     style = ttk.Style(root)
     style.theme_use('clam')
     
+    estado_gui = {
+        "df_banco_atual": pd.DataFrame(),
+        "caminho_banco_atual": "",
+        "alterado": False,
+        "df_erros_atual": pd.DataFrame(),
+        "caminho_erros_atual": "",
+        "alterado_erros": False,
+        "timer_autosave": None
+    }
+
+    def remover_duplicidades_df(df):
+        if df.empty:
+            return df, 0
+        mascara_validos = (df['CPF'] != 'CPF não identificado') & (df['CPF'] != 'Não identificado') & (df['CPF'] != 'CPF Inválido')
+        cols_subset = [c for c in ['Nome Completo', 'CPF', 'Nome do Animal', 'Tipo de Termo'] if c in df.columns]
+        if not cols_subset:
+            return df, 0
+        duplicados = df[mascara_validos].duplicated(subset=cols_subset, keep='first')
+        qtd = duplicados.sum()
+        df_limpo = df.drop(duplicados[duplicados].index).reset_index(drop=True)
+        return df_limpo, qtd
+
+    def salvar_banco_atual():
+        if estado_gui.get("alterado") and estado_gui.get("caminho_banco_atual") and not estado_gui["df_banco_atual"].empty:
+            try:
+                estado_gui["df_banco_atual"].to_excel(estado_gui["caminho_banco_atual"], index=False, engine='openpyxl')
+                estado_gui["alterado"] = False
+                print(f"Banco de dados salvo com sucesso: {estado_gui['caminho_banco_atual']}")
+            except Exception as e:
+                print(f"Erro ao salvar banco de dados: {e}")
+                messagebox.showerror("Erro ao Salvar", f"Não foi possível salvar as alterações:\n{e}")
+
+    def salvar_erros_atual():
+        if estado_gui.get("alterado_erros") and estado_gui.get("caminho_erros_atual") and not estado_gui["df_erros_atual"].empty:
+            try:
+                estado_gui["df_erros_atual"].to_excel(estado_gui["caminho_erros_atual"], index=False, engine='openpyxl')
+                estado_gui["alterado_erros"] = False
+                print(f"Relatório de erros salvo com sucesso: {estado_gui['caminho_erros_atual']}")
+            except Exception as e:
+                print(f"Erro ao salvar erros: {e}")
+                messagebox.showerror("Erro ao Salvar", f"Não foi possível salvar os erros:\n{e}")
+
+    def autosave():
+        if estado_gui.get("alterado"):
+            salvar_banco_atual()
+        if estado_gui.get("alterado_erros"):
+            salvar_erros_atual()
+        estado_gui["timer_autosave"] = root.after(60000, autosave) # Autosave a cada 60s
+
     frame_top = ctk.CTkFrame(root, fg_color="transparent")
     frame_top.pack(fill=tk.X, padx=15, pady=(15, 0))
     
@@ -737,7 +910,18 @@ def iniciar_gui():
     frame_pesquisa = ctk.CTkFrame(tab_banco)
     frame_pesquisa.pack(fill=tk.X, padx=10, pady=(10, 0))
     
-    ctk.CTkLabel(frame_pesquisa, text="Pesquisar por Nome/CPF:", font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT, padx=(10, 5), pady=10)
+    ctk.CTkLabel(frame_pesquisa, text="Banco:", font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT, padx=(10, 5), pady=10)
+    tipo_banco_var = ctk.StringVar(value="Cirúrgico")
+    
+    def ao_mudar_banco(_):
+        if estado_gui.get("alterado"):
+            salvar_banco_atual()
+        atualizar_tabelas()
+        
+    combo_banco = ctk.CTkComboBox(frame_pesquisa, values=["Cirúrgico", "Antiparasitário", "Anestésico", "Não identificado"], variable=tipo_banco_var, command=ao_mudar_banco, width=150)
+    combo_banco.pack(side=tk.LEFT, padx=5, pady=10)
+    
+    ctk.CTkLabel(frame_pesquisa, text="Pesquisar por Nome/CPF:", font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT, padx=(20, 5), pady=10)
     entrada_pesquisa = ctk.CTkEntry(frame_pesquisa, font=("Segoe UI", 12), width=250)
     entrada_pesquisa.pack(side=tk.LEFT, padx=5, pady=10)
     
@@ -746,21 +930,11 @@ def iniciar_gui():
         if not termo:
             return
             
-        caminho_input = entrada_pdf.get()
-        if caminho_input and os.path.exists(caminho_input):
-            if os.path.isdir(caminho_input):
-                diretorio_base = caminho_input
-            else:
-                diretorio_base = os.path.dirname(caminho_input)
-        else:
-            diretorio_base = os.getcwd()
-            
-        banco_mestre_path = os.path.join(diretorio_base, 'BANCO_MESTRE_CASTRA.xlsx')
-        if not os.path.exists(banco_mestre_path):
+        if estado_gui["df_banco_atual"].empty:
             return
             
         try:
-            df = pd.read_excel(banco_mestre_path).fillna("---")
+            df = estado_gui["df_banco_atual"]
             mask = df['Nome Completo'].astype(str).str.lower().str.contains(termo) | \
                    df['CPF'].astype(str).str.lower().str.contains(termo)
             df_filtrado = df[mask]
@@ -772,7 +946,7 @@ def iniciar_gui():
                 tv_banco.heading(col, text=col)
                 tv_banco.column(col, width=150, anchor=tk.CENTER)
             for _, row in df_filtrado.iterrows():
-                tv_banco.insert("", "end", values=list(row))
+                tv_banco.insert("", "end", iid=str(idx), values=list(row))
         except Exception as e:
             print(f"Erro ao pesquisar: {e}")
 
@@ -780,10 +954,158 @@ def iniciar_gui():
         entrada_pesquisa.delete(0, "end")
         atualizar_tabelas()
 
+    def btn_limpar_duplicidades_click():
+        if estado_gui["df_banco_atual"].empty:
+            return
+        df_limpo, qtd = remover_duplicidades_df(estado_gui["df_banco_atual"])
+        if qtd > 0:
+            if messagebox.askyesno("Limpar Duplicidades", f"Foram encontrados {qtd} registros duplicados nesta base.\nDeseja removê-los?"):
+                estado_gui["df_banco_atual"] = df_limpo
+                estado_gui["alterado"] = True
+                salvar_banco_atual()
+                atualizar_tabelas()
+                messagebox.showinfo("Sucesso", f"{qtd} duplicidades removidas.")
+        else:
+            messagebox.showinfo("Verificação", "Nenhuma duplicidade encontrada na base atual.")
+
+    def carregar_planilha_avulsa():
+        if estado_gui.get("alterado"):
+            salvar_banco_atual()
+        caminhos = filedialog.askopenfilenames(title="Selecione as Planilhas", filetypes=[("Arquivos Excel", "*.xlsx")])
+        if caminhos:
+            carregar_dados_tv(tv_banco, list(caminhos), is_banco=True)
+
     ctk.CTkButton(frame_pesquisa, text="Pesquisar", command=pesquisar_banco, width=100).pack(side=tk.LEFT, padx=5, pady=10)
     ctk.CTkButton(frame_pesquisa, text="Limpar Filtro", command=limpar_filtro, width=100).pack(side=tk.LEFT, padx=5, pady=10)
+    ctk.CTkButton(frame_pesquisa, text="Limpar Duplicidades", command=btn_limpar_duplicidades_click, width=150, fg_color="#d9534f", hover_color="#c9302c").pack(side=tk.LEFT, padx=5, pady=10)
+    ctk.CTkButton(frame_pesquisa, text="Carregar Planilhas", command=carregar_planilha_avulsa, width=120).pack(side=tk.LEFT, padx=5, pady=10)
+    
+    btn_salvar = ctk.CTkButton(frame_pesquisa, text="Salvar Alterações", command=salvar_banco_atual, width=130, fg_color="#2b7a4b", hover_color="#1e5c36")
+    btn_salvar.pack(side=tk.RIGHT, padx=5, pady=10)
 
     tv_banco = configurar_treeview(tab_banco)
+    
+    def configurar_edicao_treeview(tv, is_banco=True):
+        def on_double_click(event):
+            region = tv.identify("region", event.x, event.y)
+            if region != "cell":
+                return
+            
+            col = tv.identify_column(event.x)
+            row_iid = tv.identify_row(event.y)
+            if not row_iid:
+                return
+                
+            x, y, width, height = tv.bbox(row_iid, col)
+            
+            col_idx = int(col[1:]) - 1
+            col_name = tv["columns"][col_idx]
+            current_value = tv.item(row_iid, "values")[col_idx]
+            
+            entry = tk.Entry(tv, font=("Segoe UI", 10))
+            entry.place(x=x, y=y, width=width, height=height)
+            entry.insert(0, current_value if current_value != "---" else "")
+            entry.focus()
+            
+            def save_edit(event=None):
+                if not entry.winfo_exists():
+                    return
+                try:
+                    new_value = entry.get()
+                    if new_value == "":
+                        new_value = "---"
+                    
+                    old_value = current_value
+                    values = list(tv.item(row_iid, "values"))
+                    values[col_idx] = new_value
+                    tv.item(row_iid, values=values)
+                    idx = int(row_iid)
+                    
+                    if is_banco:
+                        estado_gui["df_banco_atual"].at[idx, col_name] = new_value
+                        estado_gui["alterado"] = True
+
+                        df_temp, qtd = remover_duplicidades_df(estado_gui["df_banco_atual"])
+                        if qtd > 0:
+                            estado_gui["df_banco_atual"] = df_temp
+                            salvar_banco_atual()
+                            atualizar_tabelas()
+                            messagebox.showinfo("Duplicidade Removida", "A alteração gerou um registro duplicado que foi removido automaticamente.")
+                    else:
+                        estado_gui["df_erros_atual"].at[idx, col_name] = new_value
+                        estado_gui["alterado_erros"] = True
+                        salvar_erros_atual()
+                        
+                        row_data = estado_gui["df_erros_atual"].iloc[idx]
+                        tipo_novo = row_data.get('Tipo de Termo', 'Não identificado')
+                        tipo_velho = old_value if col_name == 'Tipo de Termo' else tipo_novo
+                        
+                        arq_origem = row_data.get('Arquivo Origem')
+                        pagina = row_data.get('Página')
+                        
+                        dir_base = os.path.dirname(estado_gui["caminho_erros_atual"]) if estado_gui["caminho_erros_atual"] else os.getcwd()
+                        mapa_arquivos = {
+                            'Cirúrgico': 'BANCO_MESTRE_CIRURGICO.xlsx',
+                            'Antiparasitário': 'BANCO_MESTRE_ANTIPARASITARIO.xlsx',
+                            'Anestésico': 'BANCO_MESTRE_ANESTESICO.xlsx',
+                            'Não identificado': 'BANCO_MESTRE_NAO_IDENTIFICADO.xlsx'
+                        }
+                        
+                        row_dict = row_data.to_dict()
+                        if 'Motivo da Falha' in row_dict:
+                            del row_dict['Motivo da Falha']
+                            
+                        def atualizar_bd(tipo, remover=False):
+                            nome_b = mapa_arquivos.get(tipo, 'BANCO_MESTRE_NAO_IDENTIFICADO.xlsx')
+                            cam_b = os.path.join(dir_base, nome_b)
+                            df_b = pd.DataFrame()
+                            if os.path.exists(cam_b):
+                                try: df_b = pd.read_excel(cam_b)
+                                except: pass
+                                
+                            if not df_b.empty and 'Arquivo Origem' in df_b.columns and 'Página' in df_b.columns:
+                                mask = (df_b['Arquivo Origem'] == arq_origem) & (df_b['Página'] == pagina)
+                                if remover:
+                                    df_b = df_b[~mask]
+                                else:
+                                    if mask.any():
+                                        for k, v in row_dict.items():
+                                            if k in df_b.columns:
+                                                df_b.loc[mask, k] = v
+                                    else:
+                                        df_b = pd.concat([df_b, pd.DataFrame([row_dict])], ignore_index=True)
+                            elif not remover:
+                                df_b = pd.DataFrame([row_dict])
+                                
+                            try:
+                                if not df_b.empty:
+                                    df_b.to_excel(cam_b, index=False, engine='openpyxl')
+                                    if estado_gui["caminho_banco_atual"] == cam_b:
+                                        estado_gui["df_banco_atual"] = df_b
+                            except Exception as e_bd:
+                                print(f"Erro ao salvar banco sincronizado: {e_bd}")
+
+                        if tipo_novo != tipo_velho:
+                            atualizar_bd(tipo_velho, remover=True)
+                            
+                        atualizar_bd(tipo_novo, remover=False)
+                        atualizar_tabelas()
+                        
+                except Exception as e:
+                    print(f"Erro ao salvar edição: {e}")
+                finally:
+                    entry.destroy()
+                
+            def cancel_edit(event=None):
+                entry.destroy()
+                
+            entry.bind("<Return>", save_edit)
+            entry.bind("<FocusOut>", save_edit)
+            entry.bind("<Escape>", cancel_edit)
+
+        tv.bind("<Double-1>", on_double_click)
+
+    configurar_edicao_treeview(tv_banco, is_banco=True)
     
     # --- CARDS DO RELATÓRIO DE ERROS ---
     frame_cards_erros = ctk.CTkFrame(tab_erros, fg_color="transparent")
@@ -809,23 +1131,55 @@ def iniciar_gui():
     criar_card_erro(frame_cards_erros, var_repetidos, "#6c757d")         # Cinza
 
     tv_erros = configurar_treeview(tab_erros)
+    configurar_edicao_treeview(tv_erros, is_banco=False)
     
-    def carregar_dados_tv(tv, caminho_excel):
+    def carregar_dados_tv(tv, caminhos_excel, is_banco=False):
         for row in tv.get_children(): tv.delete(row)
-        if os.path.exists(caminho_excel):
-            try:
-                df = pd.read_excel(caminho_excel).fillna("---")
-                tv["columns"] = list(df.columns)
-                tv["show"] = "headings"
-                for col in tv["columns"]:
-                    tv.heading(col, text=col)
-                    tv.column(col, width=150, anchor=tk.CENTER)
-                for _, row in df.iterrows():
-                    tv.insert("", "end", values=list(row))
-            except Exception as e:
-                print(f"Erro ao carregar visualização de {caminho_excel}: {e}")
+        
+        if isinstance(caminhos_excel, str):
+            caminhos_excel = [caminhos_excel]
+            
+        df_concat = pd.DataFrame()
+        for caminho_excel in caminhos_excel:
+            if os.path.exists(caminho_excel):
+                try:
+                    df = pd.read_excel(caminho_excel)
+                    df_concat = pd.concat([df_concat, df], ignore_index=True)
+                except Exception as e:
+                    print(f"Erro ao carregar visualização de {caminho_excel}: {e}")
+                    
+        if not df_concat.empty:
+            df_concat = df_concat.fillna("---")
+            if is_banco:
+                estado_gui["df_banco_atual"] = df_concat
+                estado_gui["caminho_banco_atual"] = caminhos_excel[0] if len(caminhos_excel) == 1 else ""
+                estado_gui["alterado"] = False
+            else:
+                estado_gui["df_erros_atual"] = df_concat
+                estado_gui["caminho_erros_atual"] = caminhos_excel[0] if len(caminhos_excel) == 1 else ""
+                estado_gui["alterado_erros"] = False
+
+            tv["columns"] = list(df_concat.columns)
+            tv["show"] = "headings"
+            for col in tv["columns"]:
+                tv.heading(col, text=col)
+                tv.column(col, width=150, anchor=tk.CENTER)
+            for idx, row in df_concat.iterrows():
+                tv.insert("", "end", iid=str(idx), values=list(row))
+        else:
+            if is_banco:
+                estado_gui["df_banco_atual"] = pd.DataFrame()
+                estado_gui["caminho_banco_atual"] = ""
+                estado_gui["alterado"] = False
+            else:
+                estado_gui["df_erros_atual"] = pd.DataFrame()
+                estado_gui["caminho_erros_atual"] = ""
+                estado_gui["alterado_erros"] = False
 
     def atualizar_tabelas():
+        if estado_gui.get("alterado"):
+            salvar_banco_atual()
+            
         caminho_input = entrada_pdf.get()
         if caminho_input and os.path.exists(caminho_input):
             if os.path.isdir(caminho_input):
@@ -835,11 +1189,18 @@ def iniciar_gui():
         else:
             diretorio_base = os.getcwd()
             
-        banco_mestre_path = os.path.join(diretorio_base, 'BANCO_MESTRE_CASTRA.xlsx')
+        mapa_arquivos = {
+            'Cirúrgico': 'BANCO_MESTRE_CIRURGICO.xlsx',
+            'Antiparasitário': 'BANCO_MESTRE_ANTIPARASITARIO.xlsx',
+            'Anestésico': 'BANCO_MESTRE_ANESTESICO.xlsx',
+            'Não identificado': 'BANCO_MESTRE_NAO_IDENTIFICADO.xlsx'
+        }
+        tipo_selecionado = tipo_banco_var.get()
+        banco_mestre_path = os.path.join(diretorio_base, mapa_arquivos.get(tipo_selecionado, 'BANCO_MESTRE_CIRURGICO.xlsx'))
         revisao_manual_path = os.path.join(diretorio_base, 'REVISAO_MANUAL_CASTRA.xlsx')
         
-        carregar_dados_tv(tv_banco, banco_mestre_path)
-        carregar_dados_tv(tv_erros, revisao_manual_path)
+        carregar_dados_tv(tv_banco, banco_mestre_path, is_banco=True)
+        carregar_dados_tv(tv_erros, revisao_manual_path, is_banco=False)
         
         # --- Atualizar Cards ---
         if os.path.exists(revisao_manual_path):
@@ -867,6 +1228,7 @@ def iniciar_gui():
             var_repetidos.set("Repetidos: 0")
 
     # Tenta carregar tabelas do diretório atual se existirem
+    autosave()
     atualizar_tabelas()
     root.mainloop()
 

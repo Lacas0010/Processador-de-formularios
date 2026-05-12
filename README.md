@@ -9,7 +9,8 @@ Um sistema automatizado com interface gráfica moderna para processamento em lot
 - **Validação de Dados:** Validação matemática de CPF e tratamento avançado contra falsos positivos.
 - **Detecção de Assinatura:** Verifica automaticamente se o documento foi assinado.
 - **Recuperação de Falhas (2ª Chance):** Aplica filtros de processamento de imagem (inversão de cores, correção de inclinação, CLAHE) caso a primeira leitura falhe.
-- **Exportação para Excel:** Salva os registros com sucesso em um Banco Mestre e gera um Relatório de Erros para revisão humana.
+- **Exportação para Excel:** Salva os registros em Bancos Mestres separados automaticamente por tipo (Cirúrgico, Antiparasitário, Anestésico) e gera um Relatório de Erros para revisão humana.
+- **Gerenciamento de Duplicidades:** Interface gráfica avançada que permite buscar, editar células diretamente via duplo-clique e remover registros duplicados com um botão.
 - **Interface Gráfica (GUI):** Desenvolvida com CustomTkinter, oferecendo suporte a temas Dark/Light, barra de progresso e abas com tabelas de visualização integradas.
 
 ## 📋 Pré-requisitos
@@ -46,6 +47,9 @@ python processador_formularios.py
 2. Clique em **"INICIAR"**.
 3. Acompanhe a barra de progresso e o log no console.
 4. Ao final, os dados estarão salvos no mesmo diretório do arquivo de origem:
-   - `BANCO_MESTRE_CASTRA.xlsx`: Registros processados com sucesso.
+   - `BANCO_MESTRE_CIRURGICO.xlsx`
+   - `BANCO_MESTRE_ANTIPARASITARIO.xlsx`
+   - `BANCO_MESTRE_ANESTESICO.xlsx`
    - `REVISAO_MANUAL_CASTRA.xlsx`: Registros que necessitam de intervenção/revisão humana.
 5. Use as abas **Base de Dados Acumulada** e **Relatório de Erros** para consultar os resultados diretamente pelo aplicativo.
+6. Utilize a barra de pesquisa na aba de Base de Dados para filtrar rapidamente por Nome ou CPF, e edite informações incorretas diretamente na tabela.
