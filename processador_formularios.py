@@ -434,6 +434,17 @@ def parsear_dados_do_texto(texto: str) -> dict:
         animal_limpo = re.sub(r'\s+', ' ', animal_limpo).strip()
         dados["Nome do Animal"] = animal_limpo if len(animal_limpo) >= 2 else "Não identificado"
 
+    # --- LIMPEZA ESPECÍFICA NA ESPÉCIE ---
+    if dados["Espécie"] not in ["Não identificado"]:
+        if re.search(r'(?i)canin[oa]?', dados["Espécie"]):
+            dados["Espécie"] = "Canina"
+        elif re.search(r'(?i)felin[oa]?', dados["Espécie"]):
+            dados["Espécie"] = "Felina"
+        else:
+            especie_limpa = re.sub(r'(?i)\b(f[eê]mea|macho)\b', '', dados["Espécie"])
+            especie_limpa = re.sub(r'\s+', ' ', especie_limpa).strip()
+            dados["Espécie"] = especie_limpa if len(especie_limpa) >= 2 else "Não identificado"
+
     # --- VALIDAÇÃO FINAL ---
     if dados["Nome Completo"] != "Não identificado" and dados["Nome do Animal"] == dados["Nome Completo"]:
         dados["Nome do Animal"] = "Não identificado"
@@ -449,6 +460,47 @@ def parsear_dados_do_texto(texto: str) -> dict:
             dados[chave] = " ".join(palavras_formatadas)
 
     return dados
+
+
+def limpar_dados_planilha(df: pd.DataFrame) -> pd.DataFrame:
+    """Aplica limpezas padronizadas (Espécie, Capitalização) em um DataFrame."""
+    if df.empty:
+        return df
+
+    df_limpo = df.copy()
+
+    # 1. Limpeza da Coluna 'Espécie'
+    if 'Espécie' in df_limpo.columns:
+        def limpar_especie_valor(especie):
+            if pd.isna(especie) or not isinstance(especie, str) or especie.strip().lower() in ["", "---", "não identificado"]:
+                return "Não identificado"
+            
+            especie_str = str(especie)
+            if re.search(r'(?i)canin[oa]?', especie_str):
+                return "Canina"
+            elif re.search(r'(?i)felin[oa]?', especie_str):
+                return "Felina"
+            else:
+                especie_limpa = re.sub(r'(?i)\b(f[eê]mea|macho)\b', '', especie_str)
+                especie_limpa = re.sub(r'\s+', ' ', especie_limpa).strip()
+                return especie_limpa if len(especie_limpa) >= 2 else "Não identificado"
+
+        df_limpo['Espécie'] = df_limpo['Espécie'].apply(limpar_especie_valor)
+
+    # 2. Capitalização Inteligente
+    excecoes_prep = ['de', 'da', 'do', 'das', 'dos', 'e']
+    for chave in ["Nome Completo", "Nome do Animal", "Espécie"]:
+        if chave in df_limpo.columns:
+            def capitalizar_inteligentemente(texto):
+                if not isinstance(texto, str) or texto.strip().lower() in ["", "---", "não identificado", "cpf não identificado", "cpf inválido"]:
+                    return texto
+                palavras = texto.split()
+                palavras_formatadas = [p.capitalize() if p.lower() not in excecoes_prep else p.lower() for p in palavras]
+                return " ".join(palavras_formatadas)
+            
+            df_limpo[chave] = df_limpo[chave].apply(capitalizar_inteligentemente)
+
+    return df_limpo
 
 
 class RedirecionadorTerminal:
@@ -563,6 +615,7 @@ def processar_pdf_formularios(caminho_pdf: str, progresso_callback=None, itens_r
             
             colunas_ordem = ['Arquivo Origem', 'Página', 'Tipo de Termo', 'Nome Completo', 'CPF', 'Nome do Animal', 'Espécie', 'Assinatura Presente']
             df_final = df_final[[col for col in colunas_ordem if col in df_final.columns]]
+            df_final = df_final.sort_values(by=['Arquivo Origem', 'Página'], ascending=[True, True])
             
             try:
                 df_final.to_excel(banco_path, index=False, engine='openpyxl')
@@ -606,7 +659,7 @@ def processar_pdf_formularios(caminho_pdf: str, progresso_callback=None, itens_r
 
             if motivos:
                 dict_erro = row.to_dict()
-                dict_erro['Motivo da Falha'] = " | ".join(motivos)
+                dict_erro['O que falta corrigir?'] = " | ".join(motivos)
                 erros_list.append(dict_erro)
 
         if itens_revisao_callback:
@@ -617,6 +670,8 @@ def processar_pdf_formularios(caminho_pdf: str, progresso_callback=None, itens_r
             if os.path.exists(revisao_manual_path):
                 try:
                     df_revisao_antigo = pd.read_excel(revisao_manual_path)
+                    if 'Motivo da Falha' in df_revisao_antigo.columns and 'O que falta corrigir?' not in df_revisao_antigo.columns:
+                        df_revisao_antigo = df_revisao_antigo.rename(columns={'Motivo da Falha': 'O que falta corrigir?'})
                     df_revisao_final = pd.concat([df_revisao_antigo, df_erros], ignore_index=True)
                 except Exception:
                     df_revisao_final = df_erros
@@ -624,7 +679,8 @@ def processar_pdf_formularios(caminho_pdf: str, progresso_callback=None, itens_r
                 df_revisao_final = df_erros
             
             try:
-                df_revisao_final = df_revisao_final.drop_duplicates(subset=['CPF', 'Nome do Animal', 'Motivo da Falha', 'Arquivo Origem'], keep='last')
+                df_revisao_final = df_revisao_final.drop_duplicates(subset=['CPF', 'Nome do Animal', 'O que falta corrigir?', 'Arquivo Origem'], keep='last')
+                df_revisao_final = df_revisao_final.sort_values(by=['Arquivo Origem', 'Página'], ascending=[True, True])
                 df_revisao_final.to_excel(revisao_manual_path, index=False, engine='openpyxl')
             except Exception: pass
 
@@ -736,9 +792,11 @@ def iniciar_gui():
         return df_limpo, qtd
 
     def salvar_banco_atual():
-        if estado_gui.get("alterado") and estado_gui.get("caminho_banco_atual") and not estado_gui["df_banco_atual"].empty:
+        if estado_gui.get("alterado") and estado_gui.get("caminho_banco_atual"):
             try:
-                estado_gui["df_banco_atual"].to_excel(estado_gui["caminho_banco_atual"], index=False, engine='openpyxl')
+                df_to_save = estado_gui["df_banco_atual"]
+                df_to_save = df_to_save.sort_values(by=['Arquivo Origem', 'Página'], ascending=[True, True])
+                df_to_save.to_excel(estado_gui["caminho_banco_atual"], index=False, engine='openpyxl')
                 estado_gui["alterado"] = False
                 print(f"Banco de dados salvo com sucesso: {estado_gui['caminho_banco_atual']}")
             except Exception as e:
@@ -746,9 +804,11 @@ def iniciar_gui():
                 messagebox.showerror("Erro ao Salvar", f"Não foi possível salvar as alterações:\n{e}")
 
     def salvar_erros_atual():
-        if estado_gui.get("alterado_erros") and estado_gui.get("caminho_erros_atual") and not estado_gui["df_erros_atual"].empty:
+        if estado_gui.get("alterado_erros") and estado_gui.get("caminho_erros_atual"):
             try:
-                estado_gui["df_erros_atual"].to_excel(estado_gui["caminho_erros_atual"], index=False, engine='openpyxl')
+                df_to_save = estado_gui["df_erros_atual"]
+                df_to_save = df_to_save.sort_values(by=['Arquivo Origem', 'Página'], ascending=[True, True])
+                df_to_save.to_excel(estado_gui["caminho_erros_atual"], index=False, engine='openpyxl')
                 estado_gui["alterado_erros"] = False
                 print(f"Relatório de erros salvo com sucesso: {estado_gui['caminho_erros_atual']}")
             except Exception as e:
@@ -783,12 +843,19 @@ def iniciar_gui():
     modo_menu.set("Dark")
     change_appearance_mode_event("Dark")
     
+    def acao_sincronizar():
+        atualizar_tabelas()
+        messagebox.showinfo("Sincronização", "As planilhas foram recarregadas e a interface foi sincronizada com sucesso!")
+
+    btn_sync_global = ctk.CTkButton(frame_top, text="🔄 Recarregar / Sincronizar", command=lambda: acao_sincronizar(), font=("Segoe UI", 12, "bold"), fg_color="#5bc0de", hover_color="#31b0d5", text_color="black")
+    btn_sync_global.pack(side=tk.LEFT, padx=10)
+    
     notebook = ctk.CTkTabview(root)
     notebook.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
     
     tab_processar = notebook.add('⚙️ Processar PDFs')
-    tab_banco = notebook.add('🗄️ Base de Dados Acumulada')
-    tab_erros = notebook.add('⚠️ Relatório de Erros')
+    tab_banco = notebook.add('🔍 Consultar Cadastros Concluídos')
+    tab_erros = notebook.add('📋 Pendências de Revisão')
     
     # --- ABA 1: PROCESSAMENTO ---
     ctk.CTkLabel(tab_processar, text="Selecione o arquivo PDF ou Pasta para processamento em lote:", font=("Segoe UI", 14, "bold")).pack(anchor=tk.W, padx=20, pady=(10, 10))
@@ -830,7 +897,7 @@ def iniciar_gui():
     lbl_revisao = ctk.CTkLabel(frame_dash, text="Itens que precisam de revisão humana: 0", font=("Segoe UI", 14, "bold"), text_color="#f38ba8")
     lbl_revisao.pack(anchor=tk.E, side=tk.BOTTOM, padx=15, pady=(0, 15))
     
-    btn_processar = ctk.CTkButton(tab_processar, text="▶ INICIAR", font=("Segoe UI", 14, "bold"), height=40, command=lambda: iniciar_thread())
+    btn_processar = ctk.CTkButton(tab_processar, text="🚀 LER FORMULÁRIOS AGORA", font=("Segoe UI", 14, "bold"), height=40, command=lambda: iniciar_thread())
     btn_processar.pack(fill=tk.X, padx=20, pady=10)
     
     # Console
@@ -879,7 +946,7 @@ def iniciar_gui():
                         
                     processar_pdf_formularios(pdf, progresso_callback=cb_progresso, itens_revisao_callback=cb_revisao)
                     
-                root.after(0, lambda: messagebox.showinfo("Concluído", "Processamento finalizado!\nVerifique as abas de Banco e Erros."))
+                root.after(0, lambda: messagebox.showinfo("Concluído", "Tudo pronto! O sistema leu todas as páginas.\n\nAgora, confira se há pendências na aba ao lado antes de fechar."))
                 root.after(0, atualizar_tabelas)
             except Exception as e:
                 root.after(0, lambda: messagebox.showerror("Erro de Execução", f"Ocorreu um erro inesperado:\n{e}"))
@@ -921,34 +988,40 @@ def iniciar_gui():
     combo_banco = ctk.CTkComboBox(frame_pesquisa, values=["Cirúrgico", "Antiparasitário", "Anestésico", "Não identificado"], variable=tipo_banco_var, command=ao_mudar_banco, width=150)
     combo_banco.pack(side=tk.LEFT, padx=5, pady=10)
     
+    lbl_total_banco = ctk.CTkLabel(frame_pesquisa, text="Registros: 0", font=("Segoe UI", 12, "bold"), text_color="#5bc0de")
+    lbl_total_banco.pack(side=tk.LEFT, padx=(5, 15), pady=10)
+
     ctk.CTkLabel(frame_pesquisa, text="Pesquisar por Nome/CPF:", font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT, padx=(20, 5), pady=10)
     entrada_pesquisa = ctk.CTkEntry(frame_pesquisa, font=("Segoe UI", 12), width=250)
     entrada_pesquisa.pack(side=tk.LEFT, padx=5, pady=10)
-    
-    def pesquisar_banco():
+
+    def pesquisar_banco(event=None):
         termo = entrada_pesquisa.get().strip().lower()
         if not termo:
+            limpar_filtro()
             return
-            
+
         if estado_gui["df_banco_atual"].empty:
             return
-            
+
         try:
             df = estado_gui["df_banco_atual"]
             mask = df['Nome Completo'].astype(str).str.lower().str.contains(termo) | \
                    df['CPF'].astype(str).str.lower().str.contains(termo)
             df_filtrado = df[mask]
-            
+
             for row in tv_banco.get_children(): tv_banco.delete(row)
-            tv_banco["columns"] = list(df_filtrado.columns)
-            tv_banco["show"] = "headings"
-            for col in tv_banco["columns"]:
-                tv_banco.heading(col, text=col)
-                tv_banco.column(col, width=150, anchor=tk.CENTER)
-            for _, row in df_filtrado.iterrows():
-                tv_banco.insert("", "end", iid=str(idx), values=list(row))
+            for idx, row in df_filtrado.iterrows():
+                tags = ()
+                cpf_val = str(row.get('CPF', ''))
+                if cpf_val not in ["---", "Não identificado", "CPF não identificado", "CPF Inválido", ""] and not validar_cpf(cpf_val):
+                    tags = ('cpf_invalido_matematico',)
+                tv_banco.insert("", "end", iid=str(idx), values=list(row), tags=tags)
+            atualizar_contadores_tabelas()
         except Exception as e:
             print(f"Erro ao pesquisar: {e}")
+
+    entrada_pesquisa.bind("<KeyRelease>", pesquisar_banco)
 
     def limpar_filtro():
         entrada_pesquisa.delete(0, "end")
@@ -968,22 +1041,42 @@ def iniciar_gui():
         else:
             messagebox.showinfo("Verificação", "Nenhuma duplicidade encontrada na base atual.")
 
+    def excluir_linha_banco():
+        selecionados = tv_banco.selection()
+        if not selecionados:
+            messagebox.showwarning("Aviso", "Selecione uma ou mais linhas na tabela para excluir.")
+            return
+        if messagebox.askyesno("Confirmar Exclusão", "Deseja realmente excluir permanentemente a(s) linha(s) selecionada(s) do Banco de Dados?"):
+            indices = [int(item) for item in selecionados]
+            estado_gui["df_banco_atual"] = estado_gui["df_banco_atual"].drop(indices).reset_index(drop=True)
+            estado_gui["alterado"] = True
+            salvar_banco_atual()
+            atualizar_tabelas()
+
     def carregar_planilha_avulsa():
         if estado_gui.get("alterado"):
             salvar_banco_atual()
-        caminhos = filedialog.askopenfilenames(title="Selecione as Planilhas", filetypes=[("Arquivos Excel", "*.xlsx")])
-        if caminhos:
-            carregar_dados_tv(tv_banco, list(caminhos), is_banco=True)
+        if estado_gui.get("alterado_erros"):
+            salvar_erros_atual()
+            
+        pasta = filedialog.askdirectory(title="Selecione a Pasta com as Planilhas")
+        if pasta:
+            # Altera o diretório de trabalho global do aplicativo
+            entrada_pdf.delete(0, "end")
+            entrada_pdf.insert(0, pasta)
+            # Deixa o sistema organizar e colocar cada arquivo em sua respectiva aba automaticamente
+            atualizar_tabelas()
+            messagebox.showinfo("Planilhas Carregadas", "As planilhas do diretório selecionado foram carregadas e distribuídas corretamente nas abas.")
 
-    ctk.CTkButton(frame_pesquisa, text="Pesquisar", command=pesquisar_banco, width=100).pack(side=tk.LEFT, padx=5, pady=10)
     ctk.CTkButton(frame_pesquisa, text="Limpar Filtro", command=limpar_filtro, width=100).pack(side=tk.LEFT, padx=5, pady=10)
     ctk.CTkButton(frame_pesquisa, text="Limpar Duplicidades", command=btn_limpar_duplicidades_click, width=150, fg_color="#d9534f", hover_color="#c9302c").pack(side=tk.LEFT, padx=5, pady=10)
+    ctk.CTkButton(frame_pesquisa, text="Excluir Linha", command=excluir_linha_banco, width=120, fg_color="#d9534f", hover_color="#c9302c").pack(side=tk.LEFT, padx=5, pady=10)
     ctk.CTkButton(frame_pesquisa, text="Carregar Planilhas", command=carregar_planilha_avulsa, width=120).pack(side=tk.LEFT, padx=5, pady=10)
-    
-    btn_salvar = ctk.CTkButton(frame_pesquisa, text="Salvar Alterações", command=salvar_banco_atual, width=130, fg_color="#2b7a4b", hover_color="#1e5c36")
+    btn_salvar = ctk.CTkButton(frame_pesquisa, text="Salvar Alterações", command=salvar_banco_atual, width=150, fg_color="#27ae60", hover_color="#1e8449", font=("Segoe UI", 12, "bold"))
     btn_salvar.pack(side=tk.RIGHT, padx=5, pady=10)
 
     tv_banco = configurar_treeview(tab_banco)
+    tv_banco.tag_configure('cpf_invalido_matematico', background='#f2dede', foreground='black')
     
     def configurar_edicao_treeview(tv, is_banco=True):
         def on_double_click(event):
@@ -1015,6 +1108,22 @@ def iniciar_gui():
                     if new_value == "":
                         new_value = "---"
                     
+                    if col_name == 'CPF' and new_value not in ["---", "Não identificado", "CPF não identificado", "CPF Inválido", ""]:
+                        num_limpo = re.sub(r'\D', '', new_value)
+                        if len(num_limpo) == 11:
+                            formatted_cpf = f"{num_limpo[:3]}.{num_limpo[3:6]}.{num_limpo[6:9]}-{num_limpo[9:]}"
+                            new_value = formatted_cpf
+                            
+                            if is_banco:
+                                if not validar_cpf(formatted_cpf):
+                                    messagebox.showwarning(
+                                        "CPF Inválido", 
+                                        "O CPF digitado é matematicamente inválido (dígito verificador incorreto), mas será salvo.\n"
+                                        "A linha será destacada para indicar o problema."
+                                    )
+                                    tv.item(row_iid, tags=('cpf_invalido_matematico',))
+                                else:
+                                    tv.item(row_iid, tags=()) # CPF é válido, remove a tag
                     old_value = current_value
                     values = list(tv.item(row_iid, "values"))
                     values[col_idx] = new_value
@@ -1024,19 +1133,18 @@ def iniciar_gui():
                     if is_banco:
                         estado_gui["df_banco_atual"].at[idx, col_name] = new_value
                         estado_gui["alterado"] = True
-
-                        df_temp, qtd = remover_duplicidades_df(estado_gui["df_banco_atual"])
-                        if qtd > 0:
-                            estado_gui["df_banco_atual"] = df_temp
-                            salvar_banco_atual()
-                            atualizar_tabelas()
-                            messagebox.showinfo("Duplicidade Removida", "A alteração gerou um registro duplicado que foi removido automaticamente.")
                     else:
                         estado_gui["df_erros_atual"].at[idx, col_name] = new_value
-                        estado_gui["alterado_erros"] = True
-                        salvar_erros_atual()
                         
-                        row_data = estado_gui["df_erros_atual"].iloc[idx]
+                        row_data = estado_gui["df_erros_atual"].loc[idx].copy()
+                        
+                        motivo_falha = str(row_data.get('O que falta corrigir?', '---')).strip()
+                        if motivo_falha in ['', '---']:
+                            estado_gui["df_erros_atual"] = estado_gui["df_erros_atual"].drop(idx)
+                            tv.delete(row_iid) # Apaga visualmente da tabela
+
+                        estado_gui["alterado_erros"] = True
+                        
                         tipo_novo = row_data.get('Tipo de Termo', 'Não identificado')
                         tipo_velho = old_value if col_name == 'Tipo de Termo' else tipo_novo
                         
@@ -1052,44 +1160,56 @@ def iniciar_gui():
                         }
                         
                         row_dict = row_data.to_dict()
-                        if 'Motivo da Falha' in row_dict:
-                            del row_dict['Motivo da Falha']
+                        if 'O que falta corrigir?' in row_dict:
+                            del row_dict['O que falta corrigir?']
                             
-                        def atualizar_bd(tipo, remover=False):
-                            nome_b = mapa_arquivos.get(tipo, 'BANCO_MESTRE_NAO_IDENTIFICADO.xlsx')
-                            cam_b = os.path.join(dir_base, nome_b)
-                            df_b = pd.DataFrame()
-                            if os.path.exists(cam_b):
-                                try: df_b = pd.read_excel(cam_b)
-                                except: pass
-                                
-                            if not df_b.empty and 'Arquivo Origem' in df_b.columns and 'Página' in df_b.columns:
-                                mask = (df_b['Arquivo Origem'] == arq_origem) & (df_b['Página'] == pagina)
-                                if remover:
-                                    df_b = df_b[~mask]
-                                else:
-                                    if mask.any():
-                                        for k, v in row_dict.items():
-                                            if k in df_b.columns:
-                                                df_b.loc[mask, k] = v
+                        def atualizar_bd_task(t_velho, t_novo, r_dict, a_origem, pag):
+                            def atualizar_bd(tipo, remover=False):
+                                nome_b = mapa_arquivos.get(tipo, 'BANCO_MESTRE_NAO_IDENTIFICADO.xlsx')
+                                cam_b = os.path.join(dir_base, nome_b)
+                                df_b = pd.DataFrame()
+                                if os.path.exists(cam_b):
+                                    try: df_b = pd.read_excel(cam_b)
+                                    except: pass
+                                    
+                                if not df_b.empty and 'Arquivo Origem' in df_b.columns and 'Página' in df_b.columns:
+                                    mask = (df_b['Arquivo Origem'] == a_origem) & (df_b['Página'] == pag)
+                                    if remover:
+                                        df_b = df_b[~mask]
                                     else:
-                                        df_b = pd.concat([df_b, pd.DataFrame([row_dict])], ignore_index=True)
-                            elif not remover:
-                                df_b = pd.DataFrame([row_dict])
-                                
-                            try:
-                                if not df_b.empty:
-                                    df_b.to_excel(cam_b, index=False, engine='openpyxl')
-                                    if estado_gui["caminho_banco_atual"] == cam_b:
-                                        estado_gui["df_banco_atual"] = df_b
-                            except Exception as e_bd:
-                                print(f"Erro ao salvar banco sincronizado: {e_bd}")
+                                        if mask.any():
+                                            for k, v in r_dict.items():
+                                                if k in df_b.columns:
+                                                    df_b.loc[mask, k] = v
+                                        else:
+                                            df_b = pd.concat([df_b, pd.DataFrame([r_dict])], ignore_index=True)
+                                elif not remover:
+                                    df_b = pd.DataFrame([r_dict])
+                                    
+                                try:
+                                    if not df_b.empty:
+                                        df_b.to_excel(cam_b, index=False, engine='openpyxl')
+                                        if estado_gui["caminho_banco_atual"] == cam_b:
+                                            def update_memory(new_df):
+                                                estado_gui["df_banco_atual"] = new_df
+                                            tv.after(0, update_memory, df_b)
+                                except Exception as e_bd:
+                                    print(f"Erro ao salvar banco sincronizado: {e_bd}")
 
-                        if tipo_novo != tipo_velho:
-                            atualizar_bd(tipo_velho, remover=True)
+                            if t_novo != t_velho:
+                                atualizar_bd(t_velho, remover=True)
+                                
+                            atualizar_bd(t_novo, remover=False)
                             
-                        atualizar_bd(tipo_novo, remover=False)
-                        atualizar_tabelas()
+                        # Roda em thread paralela para não congelar a tela
+                        threading.Thread(target=atualizar_bd_task, args=(tipo_velho, tipo_novo, row_dict, arq_origem, pagina), daemon=True).start()
+                        
+                        # Atualização instantânea (thread-safe) dos cards de indicadores na tela de Erros
+                        try:
+                            root.after(0, atualizar_cards_erros)
+                            root.after(0, atualizar_contadores_tabelas)
+                        except Exception:
+                            pass
                         
                 except Exception as e:
                     print(f"Erro ao salvar edição: {e}")
@@ -1108,6 +1228,9 @@ def iniciar_gui():
     configurar_edicao_treeview(tv_banco, is_banco=True)
     
     # --- CARDS DO RELATÓRIO DE ERROS ---
+    lbl_instrucao_erros = ctk.CTkLabel(tab_erros, text="💡 Dê um duplo-clique na célula para editar. Ao terminar de corrigir, o registro irá automaticamente para a base concluída.", font=("Segoe UI", 13, "bold"), text_color="#f0ad4e")
+    lbl_instrucao_erros.pack(anchor=tk.W, padx=15, pady=(15, 0))
+    
     frame_cards_erros = ctk.CTkFrame(tab_erros, fg_color="transparent")
     frame_cards_erros.pack(fill=tk.X, padx=10, pady=(10, 0))
 
@@ -1115,22 +1238,120 @@ def iniciar_gui():
     var_faltantes_cpf = tk.StringVar(value="CPF inválido: 0")
     var_faltantes_animal = tk.StringVar(value="Animal não ident.: 0")
     var_faltantes_especie = tk.StringVar(value="Espécie não ident.: 0")
+    var_faltantes_tipo = tk.StringVar(value="Tipo não ident.: 0")
+    var_faltantes_assinatura = tk.StringVar(value="Sem Assinatura: 0")
     var_repetidos = tk.StringVar(value="Repetidos: 0")
 
-    def criar_card_erro(parent, text_var, color):
-        card = ctk.CTkFrame(parent, fg_color=color, corner_radius=8)
+    def atualizar_cards_erros():
+        try:
+            df_erros = estado_gui["df_erros_atual"]
+            if not df_erros.empty:
+                var_faltantes_tutor.set(f"Tutor não ident.: {len(df_erros[df_erros['Nome Completo'] == 'Não identificado'])}")
+                var_faltantes_cpf.set(f"CPF inválido: {len(df_erros[df_erros['CPF'].isin(['Não identificado', 'CPF não identificado', 'CPF Inválido'])])}")
+                var_faltantes_animal.set(f"Animal não ident.: {len(df_erros[df_erros['Nome do Animal'] == 'Não identificado'])}")
+                var_faltantes_especie.set(f"Espécie não ident.: {len(df_erros[df_erros['Espécie'] == 'Não identificado'])}")
+                var_faltantes_tipo.set(f"Tipo não ident.: {len(df_erros[df_erros['Tipo de Termo'] == 'Não identificado'])}")
+                var_faltantes_assinatura.set(f"Sem Assinatura: {len(df_erros[df_erros['Assinatura Presente'] == 'Não'])}")
+                if 'O que falta corrigir?' in df_erros.columns:
+                    var_repetidos.set(f"Repetidos: {len(df_erros[df_erros['O que falta corrigir?'].astype(str).str.contains('Registro Duplicado')])}")
+                else:
+                    var_repetidos.set("Repetidos: 0")
+            else:
+                var_faltantes_tutor.set("Tutor não ident.: 0")
+                var_faltantes_cpf.set("CPF inválido: 0")
+                var_faltantes_animal.set("Animal não ident.: 0")
+                var_faltantes_especie.set("Espécie não ident.: 0")
+                var_faltantes_tipo.set("Tipo não ident.: 0")
+                var_faltantes_assinatura.set("Sem Assinatura: 0")
+                var_repetidos.set("Repetidos: 0")
+        except Exception as e:
+            print(f"Erro ao atualizar cards de erros: {e}")
+
+    def aplicar_filtro_erros(tipo_filtro):
+        df_original = estado_gui["df_erros_atual"]
+        if df_original.empty and tipo_filtro is not None:
+            return
+
+        if tipo_filtro is None:
+            df_filtrado = df_original
+        elif tipo_filtro == "tutor":
+            df_filtrado = df_original[df_original['Nome Completo'] == 'Não identificado']
+        elif tipo_filtro == "cpf":
+            df_filtrado = df_original[df_original['CPF'].isin(['Não identificado', 'CPF não identificado', 'CPF Inválido'])]
+        elif tipo_filtro == "animal":
+            df_filtrado = df_original[df_original['Nome do Animal'] == 'Não identificado']
+        elif tipo_filtro == "especie":
+            df_filtrado = df_original[df_original['Espécie'] == 'Não identificado']
+        elif tipo_filtro == "tipo":
+            df_filtrado = df_original[df_original['Tipo de Termo'] == 'Não identificado']
+        elif tipo_filtro == "assinatura":
+            df_filtrado = df_original[df_original['Assinatura Presente'] == 'Não']
+        elif tipo_filtro == "repetidos":
+            if 'O que falta corrigir?' in df_original.columns:
+                df_filtrado = df_original[df_original['O que falta corrigir?'].astype(str).str.contains('Registro Duplicado')]
+            else:
+                df_filtrado = df_original.head(0) # Retorna um DataFrame vazio com as mesmas colunas
+        else:
+            df_filtrado = df_original
+
+        tv = tv_erros
+        for row in tv.get_children(): tv.delete(row)
+        if df_filtrado.empty: return
+
+        tv["columns"] = list(df_filtrado.columns)
+        tv["show"] = "headings"
+        for col in tv["columns"]:
+            tv.heading(col, text=col)
+            tv.column(col, width=150, anchor=tk.CENTER)
+        for idx, row in df_filtrado.iterrows():
+            tv.insert("", "end", iid=str(idx), values=list(row))
+        atualizar_contadores_tabelas()
+
+    def criar_card_erro(parent, text_var, color, filtro):
+        card = ctk.CTkFrame(parent, fg_color=color, corner_radius=8, cursor="hand2")
         card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+        card.bind("<Button-1>", lambda e, f=filtro: aplicar_filtro_erros(f))
         lbl = ctk.CTkLabel(card, textvariable=text_var, font=("Segoe UI", 12, "bold"), text_color="white")
         lbl.pack(padx=5, pady=15)
+        lbl.bind("<Button-1>", lambda e, f=filtro: aplicar_filtro_erros(f))
         return card
 
-    criar_card_erro(frame_cards_erros, var_faltantes_tutor, "#d9534f")   # Vermelho
-    criar_card_erro(frame_cards_erros, var_faltantes_cpf, "#f0ad4e")     # Laranja
-    criar_card_erro(frame_cards_erros, var_faltantes_animal, "#5bc0de")  # Azul Claro
-    criar_card_erro(frame_cards_erros, var_faltantes_especie, "#5cb85c") # Verde
-    criar_card_erro(frame_cards_erros, var_repetidos, "#6c757d")         # Cinza
+    criar_card_erro(frame_cards_erros, var_faltantes_tutor, "#d9534f", "tutor")
+    criar_card_erro(frame_cards_erros, var_faltantes_cpf, "#f0ad4e", "cpf")
+    criar_card_erro(frame_cards_erros, var_faltantes_animal, "#5bc0de", "animal")
+    criar_card_erro(frame_cards_erros, var_faltantes_especie, "#5cb85c", "especie")
+    criar_card_erro(frame_cards_erros, var_faltantes_tipo, "#8e44ad", "tipo")
+    criar_card_erro(frame_cards_erros, var_faltantes_assinatura, "#e67e22", "assinatura")
+    criar_card_erro(frame_cards_erros, var_repetidos, "#6c757d", "repetidos")
+
+    frame_acoes_erros = ctk.CTkFrame(tab_erros, fg_color="transparent")
+    frame_acoes_erros.pack(fill=tk.X, padx=10, pady=(5, 0))
+
+    def excluir_linha_erros():
+        selecionados = tv_erros.selection()
+        if not selecionados:
+            messagebox.showwarning("Aviso", "Selecione uma ou mais linhas na tabela para excluir.")
+            return
+        if messagebox.askyesno("Confirmar Exclusão", "Deseja realmente excluir a(s) linha(s) selecionada(s) do Relatório de Erros?"):
+            indices = [int(item) for item in selecionados]
+            estado_gui["df_erros_atual"] = estado_gui["df_erros_atual"].drop(indices).reset_index(drop=True)
+            estado_gui["alterado_erros"] = True
+            salvar_erros_atual()
+            atualizar_tabelas()
+
+    btn_excluir_erros = ctk.CTkButton(frame_acoes_erros, text="Excluir Linha", command=excluir_linha_erros, width=120, fg_color="#d9534f", hover_color="#c9302c")
+    btn_excluir_erros.pack(side=tk.LEFT, padx=5, pady=5)
+
+    btn_limpar_filtro_erros = ctk.CTkButton(frame_acoes_erros, text="Limpar Filtro", command=lambda: aplicar_filtro_erros(None), width=120)
+    btn_limpar_filtro_erros.pack(side=tk.LEFT, padx=5, pady=5)
+
+    lbl_total_erros = ctk.CTkLabel(frame_acoes_erros, text="Pendências exibidas: 0", font=("Segoe UI", 12, "bold"), text_color="#5bc0de")
+    lbl_total_erros.pack(side=tk.RIGHT, padx=15, pady=5)
 
     tv_erros = configurar_treeview(tab_erros)
+    tv_erros.tag_configure('cpf_invalido', background='#f2dede', foreground='black')
+    tv_erros.tag_configure('duplicado', background='#fcf8e3', foreground='black')
+    tv_erros.tag_configure('corrigido', background='#dff0d8', foreground='black')
     configurar_edicao_treeview(tv_erros, is_banco=False)
     
     def carregar_dados_tv(tv, caminhos_excel, is_banco=False):
@@ -1141,14 +1362,37 @@ def iniciar_gui():
             
         df_concat = pd.DataFrame()
         for caminho_excel in caminhos_excel:
-            if os.path.exists(caminho_excel):
+            if caminho_excel and os.path.exists(caminho_excel):
                 try:
                     df = pd.read_excel(caminho_excel)
                     df_concat = pd.concat([df_concat, df], ignore_index=True)
                 except Exception as e:
                     print(f"Erro ao carregar visualização de {caminho_excel}: {e}")
-                    
+
+        # Garante que os dados exibidos e salvos estarão sempre ordenados
+        if not df_concat.empty and all(col in df_concat.columns for col in ['Arquivo Origem', 'Página']):
+            df_concat = df_concat.sort_values(by=['Arquivo Origem', 'Página'], ascending=[True, True]).reset_index(drop=True)
+
         if not df_concat.empty:
+            if 'Motivo da Falha' in df_concat.columns and 'O que falta corrigir?' not in df_concat.columns:
+                df_concat = df_concat.rename(columns={'Motivo da Falha': 'O que falta corrigir?'})
+
+            df_original = df_concat.copy()
+            df_limpa = limpar_dados_planilha(df_concat)
+
+            # Compara se a limpeza alterou o DataFrame. fillna é crucial para tratar NaNs de forma consistente.
+            if not df_original.fillna('temp_nan').equals(df_limpa.fillna('temp_nan')):
+                print("ℹ️ Limpeza automática de dados aplicada à planilha carregada.")
+                df_concat = df_limpa
+                
+                # Salva a planilha de volta se for um arquivo único
+                if len(caminhos_excel) == 1 and caminhos_excel[0]:
+                    try:
+                        df_concat.to_excel(caminhos_excel[0], index=False, engine='openpyxl')
+                        print(f"💾 Planilha '{os.path.basename(caminhos_excel[0])}' foi atualizada com os dados limpos.")
+                    except Exception as e:
+                        print(f"❌ Erro ao salvar planilha limpa automaticamente: {e}")
+
             df_concat = df_concat.fillna("---")
             if is_banco:
                 estado_gui["df_banco_atual"] = df_concat
@@ -1165,7 +1409,25 @@ def iniciar_gui():
                 tv.heading(col, text=col)
                 tv.column(col, width=150, anchor=tk.CENTER)
             for idx, row in df_concat.iterrows():
-                tv.insert("", "end", iid=str(idx), values=list(row))
+                tags = ()
+                if is_banco:
+                    cpf_val = str(row.get('CPF', ''))
+                    if cpf_val not in ["---", "Não identificado", "CPF não identificado", "CPF Inválido", ""] and not validar_cpf(cpf_val):
+                        tags = ('cpf_invalido_matematico',)
+                else:
+                    temp_tags = []
+                    motivo = str(row.get('O que falta corrigir?', ''))
+                    if 'CPF' in motivo:
+                        temp_tags.append('cpf_invalido')
+                    if 'Duplicado' in motivo:
+                        temp_tags.append('duplicado')
+                    if '--- Corrigido ---' in motivo:
+                        temp_tags.append('corrigido')
+                    tags = tuple(temp_tags)
+                
+                tv.insert("", "end", iid=str(idx), values=list(row), tags=tags)
+
+
         else:
             if is_banco:
                 estado_gui["df_banco_atual"] = pd.DataFrame()
@@ -1176,9 +1438,21 @@ def iniciar_gui():
                 estado_gui["caminho_erros_atual"] = ""
                 estado_gui["alterado_erros"] = False
 
+    def atualizar_contadores_tabelas():
+        try:
+            lbl_total_banco.configure(text=f"Registros: {len(tv_banco.get_children())}")
+        except Exception:
+            pass
+        try:
+            lbl_total_erros.configure(text=f"Pendências exibidas: {len(tv_erros.get_children())}")
+        except Exception:
+            pass
+
     def atualizar_tabelas():
         if estado_gui.get("alterado"):
             salvar_banco_atual()
+        if estado_gui.get("alterado_erros"):
+            salvar_erros_atual()
             
         caminho_input = entrada_pdf.get()
         if caminho_input and os.path.exists(caminho_input):
@@ -1203,29 +1477,8 @@ def iniciar_gui():
         carregar_dados_tv(tv_erros, revisao_manual_path, is_banco=False)
         
         # --- Atualizar Cards ---
-        if os.path.exists(revisao_manual_path):
-            try:
-                df_erros = pd.read_excel(revisao_manual_path)
-                
-                tutor_ausente = len(df_erros[df_erros['Nome Completo'] == 'Não identificado'])
-                cpf_ausente = len(df_erros[df_erros['CPF'].isin(['Não identificado', 'CPF não identificado', 'CPF Inválido'])])
-                animal_ausente = len(df_erros[df_erros['Nome do Animal'] == 'Não identificado'])
-                especie_ausente = len(df_erros[df_erros['Espécie'] == 'Não identificado'])
-                repetidos = len(df_erros[df_erros['Motivo da Falha'].astype(str).str.contains('Registro Duplicado')])
-                
-                var_faltantes_tutor.set(f"Tutor não ident.: {tutor_ausente}")
-                var_faltantes_cpf.set(f"CPF inválido: {cpf_ausente}")
-                var_faltantes_animal.set(f"Animal não ident.: {animal_ausente}")
-                var_faltantes_especie.set(f"Espécie não ident.: {especie_ausente}")
-                var_repetidos.set(f"Repetidos: {repetidos}")
-            except Exception as e:
-                print(f"Erro ao atualizar cards: {e}")
-        else:
-            var_faltantes_tutor.set("Tutor não ident.: 0")
-            var_faltantes_cpf.set("CPF inválido: 0")
-            var_faltantes_animal.set("Animal não ident.: 0")
-            var_faltantes_especie.set("Espécie não ident.: 0")
-            var_repetidos.set("Repetidos: 0")
+        atualizar_cards_erros()
+        atualizar_contadores_tabelas()
 
     # Tenta carregar tabelas do diretório atual se existirem
     autosave()
